@@ -1,0 +1,57 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# C extensions
+*.so
+
+# Virtual Environments
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+.venv/
+
+# Environment & Secrets
+.env
+.env.*
+!.env.example
+
+# Django & App Specific
+*.sqlite3
+*.db
+db.sqlite3
+media/
+staticfiles/
+# dist/
+image_cache/
+
+# Django Migrations
+**/migrations/*.py
+!**/migrations/__init__.py
+**/migrations/__pycache__/
+
+# Logs
+*.log
+logs/
+
+# Unit test / coverage reports
+.coverage
+.coverage.*
+nosetests.xml
+coverage.xml
+*.cover
+*.py.cover
+.hypothesis/
+.pytest_cache/
+
+# IDE & OS specific
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
