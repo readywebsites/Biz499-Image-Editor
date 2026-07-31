@@ -157,7 +157,7 @@ STATIC_URL = '/static/'
 STATIC_ROOT = BASE_DIR / 'staticfiles'
 
 STATICFILES_DIRS = [
-    d for d in [BASE_DIR / 'dist'] if d.exists()
+    d for d in [BASE_DIR / 'dist', BASE_DIR / 'dist' / 'assets'] if d.exists()
 ]
 
 MEDIA_URL = '/media/'
