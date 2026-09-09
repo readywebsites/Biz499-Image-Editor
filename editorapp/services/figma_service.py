@@ -87,8 +87,9 @@ class FigmaService:
         )
         if is_token_issue:
             msg = (
-                f"Figma API Token error ({msg}). "
-                "Please update your FIGMA_API_TOKEN in backend/.env or provide a new Personal Access Token in the admin form."
+                f"Your Figma API Token is expired or invalid ({msg}). "
+                "Please generate a new Personal Access Token in Figma (Settings > Security > Personal access tokens) "
+                "and paste it into the 'Figma Api Token' field on this form."
             )
         elif response.status_code == 403:
             msg = f"Access denied to Figma file ({msg}). Please ensure your Figma account has permissions to view this file."

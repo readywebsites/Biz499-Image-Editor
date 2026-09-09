@@ -92,9 +92,9 @@ class Template(models.Model):
             except Exception as e:
                 import logging
                 logger = logging.getLogger(__name__)
-                logger.error(f"Auto-import from Figma URL failed: {e}", exc_info=True)
-                from django.core.exceptions import ValidationError
-                raise ValidationError(f"Figma Auto-Import Failed: {e}")
+                logger.warning(f"Auto-import from Figma URL skipped or failed: {e}")
+                if not self.template_data:
+                    self.template_data = {}
 
         super().save(*args, **kwargs)
 

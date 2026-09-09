@@ -176,12 +176,7 @@ class TemplateAdmin(admin.ModelAdmin):
     element_count_display.short_description = "Layers"
 
     def save_model(self, request, obj, form, change):
-        try:
-            super().save_model(request, obj, form, change)
-        except Exception as e:
-            logger.error(f"Failed to save Template: {e}", exc_info=True)
-            messages.error(request, f"Error saving template: {e}")
-            return
+        super().save_model(request, obj, form, change)
 
         if getattr(form, '_import_succeeded', False):
             count = getattr(form, '_element_count', len(obj.template_data.get('elements', [])))
