@@ -6,7 +6,6 @@ import requests
 from urllib.parse import urlparse, parse_qs
 from requests.exceptions import HTTPError
 from django.conf import settings
-from dotenv import load_dotenv
 
 logger = logging.getLogger(__name__)
 

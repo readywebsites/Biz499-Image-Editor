@@ -9,7 +9,6 @@ from django.urls import reverse
 from django.utils.html import format_html
 from django.http import HttpResponseRedirect
 from .models import Template, FigmaImportJob, Element
-from .services.figma_importer import FigmaImporter
 
 logger = logging.getLogger(__name__)
 
@@ -90,6 +89,7 @@ class TemplateAdminForm(forms.ModelForm):
             figma_url_changed = bool(figma_url)
 
         if figma_url and figma_url_changed:
+            from .services.figma_importer import FigmaImporter
             file_key, node_id = FigmaImporter.parse_figma_url(figma_url)
             if not file_key:
                 self.add_error('figma_url', "Could not extract a valid Figma File Key from the URL. Please check your link.")
