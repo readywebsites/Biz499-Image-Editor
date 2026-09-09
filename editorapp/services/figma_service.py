@@ -42,10 +42,25 @@ class FigmaService:
     API_BASE_URL = "https://api.figma.com/v1"
 
     def __init__(self, api_token=None):
+        env_token = None
         env_path = os.path.join(settings.BASE_DIR, '.env')
-        load_dotenv(env_path, override=True)
-        
-        token = api_token or os.getenv('FIGMA_API_TOKEN') or getattr(settings, 'FIGMA_API_TOKEN', None)
+        if os.path.exists(env_path):
+            try:
+                from dotenv import load_dotenv
+                load_dotenv(env_path, override=True)
+            except ImportError:
+                pass
+            try:
+                with open(env_path, 'r', encoding='utf-8') as f:
+                    for line in f:
+                        line = line.strip()
+                        if line.startswith('FIGMA_API_TOKEN='):
+                            env_token = line.split('=', 1)[1].strip().strip('"\'')
+                            break
+            except Exception:
+                pass
+
+        token = api_token or os.getenv('FIGMA_API_TOKEN') or env_token or getattr(settings, 'FIGMA_API_TOKEN', None)
         if token:
             token = token.strip().strip('"\'')
         self.api_token = token
