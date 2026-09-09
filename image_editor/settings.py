@@ -11,14 +11,31 @@ https://docs.djangoproject.com/en/6.0/ref/settings/
 """
 
 import os
-from dotenv import load_dotenv
 from pathlib import Path
 
 # Build paths inside the project like this: BASE_DIR / 'subdir'.
 BASE_DIR = Path(__file__).resolve().parent.parent
 
 # Load environment variables from .env file
-load_dotenv(os.path.join(BASE_DIR, '.env'))
+env_file = os.path.join(BASE_DIR, '.env')
+if os.path.exists(env_file):
+    try:
+        from dotenv import load_dotenv
+        load_dotenv(env_file, override=True)
+    except ImportError:
+        pass
+    try:
+        with open(env_file, 'r', encoding='utf-8') as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith('#') and '=' in line:
+                    k, v = line.split('=', 1)
+                    k = k.strip()
+                    v = v.strip().strip('"\'')
+                    if k not in os.environ:
+                        os.environ[k] = v
+    except Exception:
+        pass
 
 # Figma API Token
 FIGMA_API_TOKEN = os.getenv('FIGMA_API_TOKEN')
