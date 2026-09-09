@@ -12,7 +12,7 @@ class Template(models.Model):
     description = models.TextField(blank=True)
     category = models.CharField(max_length=100, blank=True)
     thumbnail = models.URLField(max_length=200, blank=True)
-    template_data = models.JSONField(default=dict)
+    template_data = models.JSONField(default=dict, blank=True)
     background_image = models.ImageField(upload_to='template_backgrounds/', blank=True, null=True)
     width = models.PositiveIntegerField(blank=True, null=True)
     height = models.PositiveIntegerField(blank=True, null=True)
@@ -67,7 +67,19 @@ class Template(models.Model):
         else:
             figma_url_changed = bool(self.figma_url)
 
-        if figma_url_changed and self.figma_url and not (self.template_data and self.template_data.get('elements')):
+        # Ensure template_data is parsed if provided as a JSON string
+        if isinstance(self.template_data, str):
+            try:
+                import json
+                self.template_data = json.loads(self.template_data) if self.template_data.strip() else {}
+            except Exception:
+                self.template_data = {}
+        elif not isinstance(self.template_data, dict):
+            self.template_data = {}
+
+        has_elements = bool(self.template_data.get('elements'))
+
+        if figma_url_changed and self.figma_url and not has_elements:
             try:
                 from .services.figma_importer import FigmaImporter
                 importer = FigmaImporter()
@@ -81,7 +93,8 @@ class Template(models.Model):
                 import logging
                 logger = logging.getLogger(__name__)
                 logger.error(f"Auto-import from Figma URL failed: {e}", exc_info=True)
-                raise ValueError(f"Figma Auto-Import Failed: {e}")
+                from django.core.exceptions import ValidationError
+                raise ValidationError(f"Figma Auto-Import Failed: {e}")
 
         super().save(*args, **kwargs)
 

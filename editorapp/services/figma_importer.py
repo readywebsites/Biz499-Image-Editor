@@ -62,6 +62,9 @@ class FigmaImporter:
                     figma_document = node_response
                     logger.info(f"Successfully fetched targeted node '{node_id}'.")
             except Exception as e:
+                # If authentication or authorization failed, fail fast instead of retrying
+                if hasattr(e, 'response') and getattr(e.response, 'status_code', None) in (401, 403):
+                    raise
                 logger.warning(f"Failed to fetch targeted node '{node_id}': {e}. Falling back to full document...")
 
         if not figma_document:

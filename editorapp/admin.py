@@ -37,10 +37,37 @@ class TemplateAdminForm(forms.ModelForm):
         widget=forms.PasswordInput(render_value=True),
         help_text="Optional: Enter or update your Figma Personal Access Token here. It will be saved into backend/.env."
     )
+    template_data = forms.CharField(
+        required=False,
+        widget=forms.Textarea(attrs={'rows': 5}),
+        help_text="JSON template data. Leave empty if auto-importing from Figma URL."
+    )
 
     class Meta:
         model = Template
         fields = '__all__'
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        if self.instance and self.instance.pk:
+            import json
+            t_data = self.instance.template_data
+            if isinstance(t_data, dict):
+                self.initial['template_data'] = json.dumps(t_data, indent=2)
+            elif isinstance(t_data, str):
+                self.initial['template_data'] = t_data
+
+    def clean_template_data(self):
+        data = self.cleaned_data.get('template_data')
+        if not data or not data.strip():
+            return {}
+        if isinstance(data, dict):
+            return data
+        try:
+            import json
+            return json.loads(data)
+        except Exception as e:
+            raise forms.ValidationError(f"Invalid JSON format: {e}")
 
     def clean(self):
         cleaned_data = super().clean()
@@ -87,6 +114,11 @@ class TemplateAdminForm(forms.ModelForm):
                     logger.warning(f"Figma auto-import validation failed: {e}")
                     self.add_error('figma_url', f"Figma Auto-Import Failed: {e}")
 
+        # Ensure template_data defaults to an empty dict if not set
+        if not cleaned_data.get('template_data'):
+            cleaned_data['template_data'] = {}
+            self.instance.template_data = {}
+
         return cleaned_data
 
 @admin.register(Element)
@@ -130,13 +162,27 @@ class TemplateAdmin(admin.ModelAdmin):
     )
 
     def element_count_display(self, obj):
-        data = obj.template_data or {}
-        elements = data.get('elements', [])
+        data = obj.template_data
+        if isinstance(data, str):
+            try:
+                import json
+                data = json.loads(data)
+            except Exception:
+                data = {}
+        elif not isinstance(data, dict):
+            data = {}
+        elements = data.get('elements', []) if isinstance(data, dict) else []
         return f"{len(elements)} elements"
     element_count_display.short_description = "Layers"
 
     def save_model(self, request, obj, form, change):
-        super().save_model(request, obj, form, change)
+        try:
+            super().save_model(request, obj, form, change)
+        except Exception as e:
+            logger.error(f"Failed to save Template: {e}", exc_info=True)
+            messages.error(request, f"Error saving template: {e}")
+            return
+
         if getattr(form, '_import_succeeded', False):
             count = getattr(form, '_element_count', len(obj.template_data.get('elements', [])))
             messages.success(

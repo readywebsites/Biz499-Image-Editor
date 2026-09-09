@@ -53,13 +53,29 @@ class TemplateSerializer(serializers.ModelSerializer):
             try:
                 from ..models import TemplateEditSession
                 session_edit = TemplateEditSession.objects.get(session_id=session_id, template=instance)
-                # Copy JSON dict to avoid mutating database models cache
-                template_data = dict(session_edit.template_data)
+                t_data = session_edit.template_data
+                if isinstance(t_data, dict):
+                    template_data = dict(t_data)
+                elif isinstance(t_data, str) and t_data.strip():
+                    import json
+                    template_data = json.loads(t_data)
+                else:
+                    template_data = {}
             except TemplateEditSession.DoesNotExist:
                 pass
                 
         if template_data is None:
-            template_data = dict(instance.template_data)
+            t_data = instance.template_data
+            if isinstance(t_data, dict):
+                template_data = dict(t_data)
+            elif isinstance(t_data, str) and t_data.strip():
+                try:
+                    import json
+                    template_data = json.loads(t_data)
+                except Exception:
+                    template_data = {}
+            else:
+                template_data = {}
             
         data = super().to_representation(instance)
         data['template_data'] = template_data
