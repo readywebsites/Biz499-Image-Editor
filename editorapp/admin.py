@@ -191,8 +191,30 @@ class TemplateAdmin(admin.ModelAdmin):
                 "All vector SVGs, photos, typography, and background have been saved and are ready in the editor."
             )
 
+class FigmaImportJobForm(forms.ModelForm):
+    figma_api_token = forms.CharField(
+        required=False,
+        widget=forms.PasswordInput(render_value=True),
+        help_text="Optional: Enter or update your Figma Personal Access Token here. It will be saved into backend/.env."
+    )
+
+    class Meta:
+        model = FigmaImportJob
+        fields = '__all__'
+
+    def clean(self):
+        cleaned_data = super().clean()
+        token = cleaned_data.get('figma_api_token')
+        if token and token.strip():
+            clean_token = token.strip()
+            update_figma_token_in_env(clean_token)
+            os.environ['FIGMA_API_TOKEN'] = clean_token
+            settings.FIGMA_API_TOKEN = clean_token
+        return cleaned_data
+
 @admin.register(FigmaImportJob)
 class FigmaImportJobAdmin(admin.ModelAdmin):
+    form = FigmaImportJobForm
     list_display = ('name', 'status', 'created_at', 'template')
     list_filter = ('status',)
     readonly_fields = ('status', 'error_message', 'template', 'created_at', 'updated_at')
@@ -201,7 +223,7 @@ class FigmaImportJobAdmin(admin.ModelAdmin):
 
     fieldsets = (
         (None, {
-            'fields': ('name', 'figma_url')
+            'fields': ('name', 'figma_url', 'figma_api_token')
         }),
         ('Job Status', {
             'classes': ('collapse',),
@@ -219,9 +241,10 @@ class FigmaImportJobAdmin(admin.ModelAdmin):
 
         # Process import
         try:
+            token = form.cleaned_data.get('figma_api_token') if form else None
             from .services.figma_importer import FigmaImporter
             importer = FigmaImporter()
-            result = importer.import_from_url(obj.figma_url, obj.name)
+            result = importer.import_from_url(obj.figma_url, obj.name, api_token=token or None)
 
             template = Template.objects.create(
                 name=obj.name,
