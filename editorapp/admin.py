@@ -1,14 +1,93 @@
 import logging
 import subprocess
 import os
+import re
+from django import forms
 from django.conf import settings
 from django.contrib import admin, messages
 from django.urls import reverse
 from django.utils.html import format_html
 from django.http import HttpResponseRedirect
 from .models import Template, FigmaImportJob, Element
+from .services.figma_importer import FigmaImporter
 
 logger = logging.getLogger(__name__)
+
+def update_figma_token_in_env(new_token):
+    """Safely updates FIGMA_API_TOKEN in backend/.env."""
+    env_path = os.path.join(settings.BASE_DIR, '.env')
+    try:
+        content = ""
+        if os.path.exists(env_path):
+            with open(env_path, 'r', encoding='utf-8') as f:
+                content = f.read()
+        if 'FIGMA_API_TOKEN' in content:
+            content = re.sub(r'FIGMA_API_TOKEN\s*=.*', f'FIGMA_API_TOKEN="{new_token}"', content)
+        else:
+            content = content.rstrip() + f'\nFIGMA_API_TOKEN="{new_token}"\n'
+        with open(env_path, 'w', encoding='utf-8') as f:
+            f.write(content)
+        logger.info("Updated FIGMA_API_TOKEN in .env")
+    except Exception as e:
+        logger.error(f"Failed to update FIGMA_API_TOKEN in .env: {e}")
+
+class TemplateAdminForm(forms.ModelForm):
+    figma_api_token = forms.CharField(
+        required=False,
+        widget=forms.PasswordInput(render_value=True),
+        help_text="Optional: Enter or update your Figma Personal Access Token here. It will be saved into backend/.env."
+    )
+
+    class Meta:
+        model = Template
+        fields = '__all__'
+
+    def clean(self):
+        cleaned_data = super().clean()
+        token = cleaned_data.get('figma_api_token')
+        if token and token.strip():
+            clean_token = token.strip()
+            update_figma_token_in_env(clean_token)
+            os.environ['FIGMA_API_TOKEN'] = clean_token
+            settings.FIGMA_API_TOKEN = clean_token
+
+        figma_url = cleaned_data.get('figma_url')
+        name = cleaned_data.get('name') or "Figma Template"
+
+        # Check if figma_url is new or changed
+        figma_url_changed = False
+        if self.instance and self.instance.pk:
+            orig = Template.objects.filter(pk=self.instance.pk).first()
+            figma_url_changed = orig and orig.figma_url != figma_url
+        else:
+            figma_url_changed = bool(figma_url)
+
+        if figma_url and figma_url_changed:
+            file_key, node_id = FigmaImporter.parse_figma_url(figma_url)
+            if not file_key:
+                self.add_error('figma_url', "Could not extract a valid Figma File Key from the URL. Please check your link.")
+            else:
+                try:
+                    importer = FigmaImporter()
+                    result = importer.import_from_url(figma_url, name, api_token=token or None)
+                    
+                    cleaned_data['template_data'] = result['template_data']
+                    cleaned_data['background_image'] = result['background_image_path']
+                    cleaned_data['width'] = result['width']
+                    cleaned_data['height'] = result['height']
+                    
+                    self.instance.template_data = result['template_data']
+                    self.instance.background_image = result['background_image_path']
+                    self.instance.width = result['width']
+                    self.instance.height = result['height']
+                    
+                    self._import_succeeded = True
+                    self._element_count = len(result['template_data'].get('elements', []))
+                except Exception as e:
+                    logger.warning(f"Figma auto-import validation failed: {e}")
+                    self.add_error('figma_url', f"Figma Auto-Import Failed: {e}")
+
+        return cleaned_data
 
 @admin.register(Element)
 class ElementAdmin(admin.ModelAdmin):
@@ -18,21 +97,25 @@ class ElementAdmin(admin.ModelAdmin):
 
 @admin.register(Template)
 class TemplateAdmin(admin.ModelAdmin):
-    list_display = ('name', 'category', 'status', 'created_at', 'updated_at')
+    form = TemplateAdminForm
+    list_display = ('name', 'category', 'status', 'element_count_display', 'width', 'height', 'created_at', 'updated_at')
     list_filter = ('status', 'category')
-    search_fields = ('name', 'description')
+    search_fields = ('name', 'description', 'figma_url')
     prepopulated_fields = {'slug': ('name',)}
     date_hierarchy = 'created_at'
     ordering = ('status', '-created_at')
     readonly_fields = ('created_at', 'updated_at')
+
     fieldsets = (
-        (None, {
-            'fields': ('name', 'slug', 'description', 'category', 'status', 'figma_url')
+        ("Figma Automated Import (Just enter Title & Figma URL)", {
+            'fields': ('name', 'figma_url', 'figma_api_token', 'category', 'status', 'description', 'slug')
         }),
-        ('Template Data (Populated automatically or entered manually)', {
+        ('Template Data (Populated automatically from Figma, or edit manually)', {
+            'classes': ('collapse',),
             'fields': ('template_data', 'background_image', 'width', 'height')
         }),
-        ('Admin Uploadable Editable Images', {
+        ('Manual Image Uploads (Optional fallback)', {
+            'classes': ('collapse',),
             'fields': (
                 'image_1', 'image_2', 'image_3', 'image_4', 'image_5',
                 'image_6', 'image_7', 'image_8', 'image_9', 'image_10',
@@ -40,11 +123,27 @@ class TemplateAdmin(admin.ModelAdmin):
                 'image_16', 'image_17', 'image_18', 'image_19', 'image_20'
             )
         }),
-        ('Read-only', {
+        ('Read-only Details', {
             'classes': ('collapse',),
             'fields': ('created_at', 'updated_at', 'thumbnail')
         })
     )
+
+    def element_count_display(self, obj):
+        data = obj.template_data or {}
+        elements = data.get('elements', [])
+        return f"{len(elements)} elements"
+    element_count_display.short_description = "Layers"
+
+    def save_model(self, request, obj, form, change):
+        super().save_model(request, obj, form, change)
+        if getattr(form, '_import_succeeded', False):
+            count = getattr(form, '_element_count', len(obj.template_data.get('elements', [])))
+            messages.success(
+                request,
+                f"🎉 Successfully imported Figma design '{obj.name}' with {count} editable elements! "
+                "All vector SVGs, photos, typography, and background have been saved and are ready in the editor."
+            )
 
 @admin.register(FigmaImportJob)
 class FigmaImportJobAdmin(admin.ModelAdmin):
@@ -65,7 +164,6 @@ class FigmaImportJobAdmin(admin.ModelAdmin):
     )
 
     def save_model(self, request, obj, form, change):
-        # If resaving an existing job, reset status to run it again.
         if change:
             obj.status = 'pending'
             obj.template = None
@@ -73,32 +171,38 @@ class FigmaImportJobAdmin(admin.ModelAdmin):
         
         super().save_model(request, obj, form, change)
 
+        # Process import
         try:
-            # Correctly locate the python executable in the virtualenv
-            # On Windows, it's in 'env/Scripts/python.exe'
-            python_executable = os.path.join(settings.BASE_DIR, 'env', 'Scripts', 'python.exe')
-            manage_py_path = os.path.join(settings.BASE_DIR, 'manage.py')
+            from .services.figma_importer import FigmaImporter
+            importer = FigmaImporter()
+            result = importer.import_from_url(obj.figma_url, obj.name)
 
-            if not os.path.exists(python_executable):
-                 raise FileNotFoundError(f"Python executable not found at {python_executable}")
+            template = Template.objects.create(
+                name=obj.name,
+                figma_url=obj.figma_url,
+                template_data=result['template_data'],
+                background_image=result['background_image_path'],
+                width=result['width'],
+                height=result['height'],
+                status='published'
+            )
 
-            # Command to execute
-            command = [python_executable, manage_py_path, 'process_figma_imports']
+            obj.status = 'completed'
+            obj.template = template
+            obj.error_message = None
+            obj.save()
 
-            # Use Popen to run the command in a new process without blocking.
-            # cwd is set to the backend directory where manage.py is.
-            subprocess.Popen(command, cwd=settings.BASE_DIR)
-            
-            messages.info(request, "The Figma import job has been started in the background. You can refresh this page to see its status.")
-
-        except FileNotFoundError as e:
-            error_msg = f"Could not start background process: {e}. Please run the import manually via the command line."
-            messages.error(request, error_msg)
-            logger.error(error_msg, exc_info=True)
+            element_count = len(result['template_data'].get('elements', []))
+            messages.success(
+                request,
+                f"🎉 Figma import job completed! Template '{template.name}' created with {element_count} editable elements."
+            )
         except Exception as e:
-            error_msg = f"An unexpected error occurred while trying to start the background process: {e}"
-            messages.error(request, error_msg)
-            logger.error(error_msg, exc_info=True)
+            obj.status = 'failed'
+            obj.error_message = str(e)
+            obj.save()
+            logger.error(f"FigmaImportJob failed: {e}", exc_info=True)
+            messages.error(request, f"Figma Import Failed: {e}")
 
     def response_add(self, request, obj, post_url_continue=None):
         return HttpResponseRedirect(reverse('admin:editorapp_figmaimportjob_changelist'))

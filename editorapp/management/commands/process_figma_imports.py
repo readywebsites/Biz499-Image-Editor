@@ -134,27 +134,20 @@ class Command(BaseCommand):
                         else:
                             raise FileNotFoundError("Local mock latest_template.json not found.")
                     else:
-                        # Real Figma API call
-                        figma_document = figma_service.get_file(file_key)
-                        converter = FigmaConverter(
-                            figma_document=figma_document,
-                            figma_service=figma_service,
-                            file_key=file_key
-                        )
-                        conversion_result = converter.convert()
+                        # Real Figma API call via FigmaImporter
+                        from editorapp.services.figma_importer import FigmaImporter
+                        importer = FigmaImporter()
+                        result = importer.import_from_url(job.figma_url, job.name)
 
-                    new_template = Template(
-                        name=job.name,
-                        template_data=conversion_result['template_data'],
-                        width=conversion_result['width'],
-                        height=conversion_result['height'],
-                        status='draft'
-                    )
-                    new_template.background_image.save(
-                        conversion_result['background_image'].name,
-                        conversion_result['background_image']
-                    )
-                    new_template.save()
+                        new_template = Template.objects.create(
+                            name=job.name,
+                            figma_url=job.figma_url,
+                            template_data=result['template_data'],
+                            background_image=result['background_image_path'],
+                            width=result['width'],
+                            height=result['height'],
+                            status='published'
+                        )
 
                     job.status = 'completed'
                     job.template = new_template

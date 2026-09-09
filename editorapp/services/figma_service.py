@@ -1,147 +1,213 @@
-import requests
-from django.conf import settings
+import os
 import re
-import backoff
-import logging
 import time
+import logging
+import requests
+from urllib.parse import urlparse, parse_qs
 from requests.exceptions import HTTPError
+from django.conf import settings
+from dotenv import load_dotenv
 
 logger = logging.getLogger(__name__)
 
-def _is_rate_limit_error(e):
-    """Check if the exception is a rate limit error (status code 429)."""
-    is_http_error = isinstance(e, HTTPError)
-    if is_http_error and e.response.status_code == 429:
-        # Check if Retry-After is too large
-        retry_after = e.response.headers.get('Retry-After')
-        if retry_after:
-            try:
-                seconds = int(retry_after)
-                if seconds > 30:
-                    logger.warning(f"Figma API rate limit exceeded. Retry-After is too large ({seconds}s). Giving up.")
-                    return False
-            except ValueError:
-                pass
-        logger.warning("Figma API rate limit exceeded. Retrying with backoff...")
-        return True
-    return False
+def retry_request(func, max_tries=3, initial_delay=1.0):
+    """Dependency-free exponential backoff retry for HTTP requests."""
+    delay = initial_delay
+    for attempt in range(1, max_tries + 1):
+        try:
+            return func()
+        except HTTPError as e:
+            status = e.response.status_code if e.response is not None else 0
+            if attempt < max_tries and status in (429, 500, 502, 503, 504):
+                retry_after = e.response.headers.get('Retry-After') if e.response is not None else None
+                sleep_time = delay
+                if retry_after:
+                    try:
+                        sleep_time = min(30, int(retry_after))
+                    except ValueError:
+                        pass
+                logger.warning(f"Figma API request returned {status}. Retrying in {sleep_time}s (attempt {attempt}/{max_tries})...")
+                time.sleep(sleep_time)
+                delay *= 2
+            else:
+                raise
+        except requests.RequestException as e:
+            if attempt < max_tries:
+                logger.warning(f"Figma API network error: {e}. Retrying in {delay}s (attempt {attempt}/{max_tries})...")
+                time.sleep(delay)
+                delay *= 2
+            else:
+                raise
 
 class FigmaService:
     API_BASE_URL = "https://api.figma.com/v1"
 
     def __init__(self, api_token=None):
-        import os
-        from dotenv import load_dotenv
         env_path = os.path.join(settings.BASE_DIR, '.env')
         load_dotenv(env_path, override=True)
         
-        token = api_token or os.getenv('FIGMA_API_TOKEN') or settings.FIGMA_API_TOKEN
+        token = api_token or os.getenv('FIGMA_API_TOKEN') or getattr(settings, 'FIGMA_API_TOKEN', None)
         if token:
             token = token.strip().strip('"\'')
         self.api_token = token
         
         if not self.api_token or self.api_token == "your_figma_api_token_here":
-            raise ValueError("Figma API token is not configured. Please set it in your .env file.")
+            raise ValueError(
+                "Figma API token is not configured. Please set FIGMA_API_TOKEN in your backend/.env file "
+                "or enter your active Figma Personal Access Token."
+            )
         self.headers = {"X-Figma-Token": self.api_token}
 
     def _handle_error(self, response, e):
-        """A helper to format HTTP errors."""
+        """A helper to format HTTP errors with actionable feedback."""
         try:
             error_details = response.json()
             msg = error_details.get('err') or error_details.get('message') or "Unknown Figma API error"
         except ValueError:
             msg = response.text
-        e.args = (f"Figma API Error: {msg}",)
+
+        is_token_issue = (
+            response.status_code == 401 or
+            "token" in msg.lower() or
+            "expired" in msg.lower()
+        )
+        if is_token_issue:
+            msg = (
+                f"Figma API Token error ({msg}). "
+                "Please update your FIGMA_API_TOKEN in backend/.env or provide a new Personal Access Token in the admin form."
+            )
+        elif response.status_code == 403:
+            msg = f"Access denied to Figma file ({msg}). Please ensure your Figma account has permissions to view this file."
+        elif response.status_code == 404:
+            msg = f"Figma file or node was not found ({msg}). Please verify your Figma URL."
+        elif response.status_code == 429:
+            msg = f"Figma API rate limit exceeded ({msg}). Please wait a minute and try again."
+
+        e.args = (f"Figma API Error ({response.status_code}): {msg}",)
         raise e
 
-    @backoff.on_exception(backoff.expo, HTTPError, max_tries=15, giveup=lambda e: not _is_rate_limit_error(e))
     def get_file(self, file_key):
-        """Fetches a Figma file document, with exponential backoff on rate limits."""
+        """Fetches full Figma file document."""
         url = f"{self.API_BASE_URL}/files/{file_key}"
         logger.info(f"Making Figma API call: GET {url}")
-        try:
-            response = requests.get(url, headers=self.headers)
+
+        def _fetch():
+            response = requests.get(url, headers=self.headers, timeout=35)
             response.raise_for_status()
             return response.json()
+
+        try:
+            return retry_request(_fetch)
         except HTTPError as e:
             self._handle_error(e.response, e)
 
-    @backoff.on_exception(backoff.expo, HTTPError, max_tries=15, giveup=lambda e: not _is_rate_limit_error(e))
+    def get_file_node(self, file_key, node_id):
+        """Fetches a specific node subtree from a Figma file."""
+        url = f"{self.API_BASE_URL}/files/{file_key}/nodes"
+        params = {"ids": node_id}
+        logger.info(f"Making Figma API call: GET {url}?ids={node_id}")
+
+        def _fetch():
+            response = requests.get(url, headers=self.headers, params=params, timeout=35)
+            response.raise_for_status()
+            return response.json()
+
+        try:
+            return retry_request(_fetch)
+        except HTTPError as e:
+            self._handle_error(e.response, e)
+
     def get_file_images(self, file_key):
-        """Fetches the image assets mapping (imageHash -> S3 URL) for a file key in a single request."""
+        """Fetches image fills mapping (imageHash -> S3 URL) for a file key."""
         url = f"{self.API_BASE_URL}/files/{file_key}/images"
         logger.info(f"Making Figma API call: GET {url}")
-        try:
-            response = requests.get(url, headers=self.headers)
+
+        def _fetch():
+            response = requests.get(url, headers=self.headers, timeout=35)
             response.raise_for_status()
             data = response.json()
             return data.get("meta", {}).get("images", {})
-        except HTTPError as e:
-            self._handle_error(e.response, e)
 
-    def get_image_urls(self, file_key, ids, chunk_size=50):
-        """
-        Fetches temporary URLs for image fills in batches.
-        Uses exponential backoff for each batch request.
-        """
-        if not ids:
+        try:
+            return retry_request(_fetch)
+        except HTTPError as e:
+            logger.warning(f"Failed to fetch image fills mapping: {e}")
             return {}
-        all_images = {}
-        for i in range(0, len(ids), chunk_size):
-            chunk = ids[i:i + chunk_size]
+
+    def export_nodes_as_svg(self, file_key, node_ids, chunk_size=30):
+        """Batch exports custom vector and shape nodes as SVG."""
+        if not node_ids:
+            return {}
+        result = {}
+        for i in range(0, len(node_ids), chunk_size):
+            chunk = node_ids[i:i + chunk_size]
+            url = f"{self.API_BASE_URL}/images/{file_key}"
+            params = {
+                "ids": ",".join(chunk),
+                "format": "svg"
+            }
+            logger.info(f"Exporting batch of {len(chunk)} SVG nodes: GET {url}")
+
+            def _fetch():
+                response = requests.get(url, headers=self.headers, params=params, timeout=45)
+                response.raise_for_status()
+                data = response.json()
+                return data.get("images", {})
+
             try:
-                image_chunk = self._get_image_url_chunk(file_key, chunk)
-                all_images.update(image_chunk)
-                time.sleep(2)  # Add a 2-second delay between chunk requests
+                images = retry_request(_fetch)
+                result.update(images)
             except HTTPError as e:
                 self._handle_error(e.response, e)
-        return all_images
+            if i + chunk_size < len(node_ids):
+                time.sleep(0.5)
+        return result
 
-    @backoff.on_exception(backoff.expo, HTTPError, max_tries=15, giveup=lambda e: not _is_rate_limit_error(e))
-    def _get_image_url_chunk(self, file_key, chunk):
-        """Helper method to fetch a single chunk of image URLs."""
-        url = f"{self.API_BASE_URL}/images/{file_key}"
-        params = {"ids": ",".join(chunk)}
-        logger.info(f"Making Figma API call: GET {url} (chunk of {len(chunk)} images)")
-        response = requests.get(url, headers=self.headers, params=params)
-        response.raise_for_status()
-        data = response.json()
-        if data.get("err"):
-            raise Exception(f"Figma API error while fetching images: {data['err']}")
-        return data.get("images", {})
+    def export_nodes_as_png(self, file_key, node_ids, scale=1, chunk_size=30):
+        """Batch exports nodes (frames, masked groups, images) as PNG."""
+        if not node_ids:
+            return {}
+        result = {}
+        for i in range(0, len(node_ids), chunk_size):
+            chunk = node_ids[i:i + chunk_size]
+            url = f"{self.API_BASE_URL}/images/{file_key}"
+            params = {
+                "ids": ",".join(chunk),
+                "format": "png",
+                "scale": str(scale),
+                "use_absolute_bounds": "true"
+            }
+            logger.info(f"Exporting batch of {len(chunk)} PNG nodes: GET {url}")
+
+            def _fetch():
+                response = requests.get(url, headers=self.headers, params=params, timeout=45)
+                response.raise_for_status()
+                data = response.json()
+                return data.get("images", {})
+
+            try:
+                images = retry_request(_fetch)
+                result.update(images)
+            except HTTPError as e:
+                self._handle_error(e.response, e)
+            if i + chunk_size < len(node_ids):
+                time.sleep(0.5)
+        return result
+
+    def export_node_as_png(self, file_key, node_id, scale=1):
+        """Exports a single node from a Figma file as a PNG image."""
+        res = self.export_nodes_as_png(file_key, [node_id], scale=scale)
+        return res.get(node_id)
 
     @staticmethod
     def extract_file_key_from_url(url):
-        """Extracts the file key from a Figma URL."""
+        """Extracts the file key from any Figma URL."""
         if not isinstance(url, str):
             return None
-        # Match figma.com followed by any path segment (like file/design/buzz/board/proto) and then the key
         match = re.search(r"figma\.com/(?:file|design|buzz|board|proto)/([a-zA-Z0-9_-]+)", url)
         if match:
             return match.group(1)
-        # Fallback: if there is a 20-24 character alpha-numeric key in the URL path, extract it
         match_fallback = re.search(r"figma\.com/[a-zA-Z0-9_-]+/([a-zA-Z0-9]{20,24})", url)
         if match_fallback:
             return match_fallback.group(1)
         return None
-
-    @backoff.on_exception(backoff.expo, HTTPError, max_tries=5, giveup=lambda e: not _is_rate_limit_error(e))
-    def export_node_as_png(self, file_key, node_id):
-        """Exports a specific node from a Figma file as a PNG image."""
-        url = f"{self.API_BASE_URL}/images/{file_key}"
-        params = {
-            "ids": node_id,
-            "format": "png",
-            "scale": "1",
-            "use_absolute_bounds": "true"
-        }
-        logger.info(f"Making Figma API call: GET {url} for node {node_id}")
-        try:
-            response = requests.get(url, headers=self.headers, params=params)
-            response.raise_for_status()
-            data = response.json()
-            if data.get("err"):
-                raise Exception(f"Figma API error while exporting node: {data['err']}")
-            return data.get("images", {}).get(node_id)
-        except HTTPError as e:
-            self._handle_error(e.response, e)

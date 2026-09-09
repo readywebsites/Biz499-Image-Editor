@@ -19,24 +19,26 @@ from django.urls import path, include, re_path
 from django.conf import settings
 from django.conf.urls.static import static
 from django.views.static import serve
-from django.views.generic import TemplateView
+from django.views.generic import TemplateView, RedirectView
 
 urlpatterns = [
     path('admin/', admin.site.urls),
     path('api/', include('editorapp.urls')),
     
+    # Redirect bare /static/ or /static to root /
+    path('static/', RedirectView.as_view(url='/', permanent=False)),
+    
     # Serve built frontend static assets directly from dist & dist/assets
     path('favicon.svg', serve, {'document_root': str(settings.BASE_DIR / 'dist'), 'path': 'favicon.svg'}),
     path('icons.svg', serve, {'document_root': str(settings.BASE_DIR / 'dist'), 'path': 'icons.svg'}),
-    re_path(r'^static/(?P<path>.*)$', serve, {'document_root': str(settings.BASE_DIR / 'dist')}),
+    re_path(r'^static/(?P<path>.+)$', serve, {'document_root': str(settings.BASE_DIR / 'dist')}),
     re_path(r'^assets/(?P<path>.*)$', serve, {'document_root': str(settings.BASE_DIR / 'dist' / 'assets')}),
 ]
 
 if settings.DEBUG:
     urlpatterns += static(settings.MEDIA_URL, document_root=settings.MEDIA_ROOT)
-    urlpatterns += static(settings.STATIC_URL, document_root=settings.BASE_DIR / 'dist')
 
-# SPA Catch-all: Route everything else to the React index.html, excluding Django admin, API, and static/media/assets routes
+# SPA Catch-all: Route everything else to the React index.html, excluding Django admin, API, and media routes
 urlpatterns += [
-    re_path(r'^(?!admin(?:/|$)|api(?:/|$)|static(?:/|$)|media(?:/|$)|favicon\.svg|icons\.svg|assets(?:/|$)).*$', TemplateView.as_view(template_name='index.html')),
+    re_path(r'^(?!admin(?:/|$)|api(?:/|$)|media(?:/|$)).*$', TemplateView.as_view(template_name='index.html')),
 ]

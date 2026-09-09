@@ -67,7 +67,7 @@ class Template(models.Model):
         else:
             figma_url_changed = bool(self.figma_url)
 
-        if figma_url_changed and self.figma_url:
+        if figma_url_changed and self.figma_url and not (self.template_data and self.template_data.get('elements')):
             try:
                 from .services.figma_importer import FigmaImporter
                 importer = FigmaImporter()
