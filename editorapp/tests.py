@@ -122,3 +122,24 @@ class FigmaImportTests(TransactionTestCase):
         self.assertEqual(job.status, 'failed')
         self.assertIsNotNone(job.error_message)
         self.assertIn("Invalid Figma URL", job.error_message)
+
+    def test_admin_changelist_rendering(self):
+        """
+        Verify that admin changelists for Template and FigmaImportJob render
+        cleanly with HTTP 200 without template rendering or format_html crashes.
+        """
+        from django.contrib.auth.models import User
+        admin_user = User.objects.create_superuser('admin_test_user', 'admin@example.com', 'password123')
+        self.client.force_login(admin_user)
+
+        # Create sample template and job to exercise list_display methods
+        tpl = Template.objects.create(name="Sample Display Template", template_data={'elements': [{'id': '1'}]})
+        FigmaImportJob.objects.create(name="Sample Job Display", status="pending", template=tpl)
+        FigmaImportJob.objects.create(name="Processing Job", status="processing")
+        FigmaImportJob.objects.create(name="Failed Job", status="failed", error_message="Sample test error")
+
+        r1 = self.client.get('/admin/editorapp/template/')
+        self.assertEqual(r1.status_code, 200)
+
+        r2 = self.client.get('/admin/editorapp/figmaimportjob/')
+        self.assertEqual(r2.status_code, 200)

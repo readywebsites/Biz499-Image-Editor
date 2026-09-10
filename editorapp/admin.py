@@ -7,6 +7,7 @@ from django.conf import settings
 from django.contrib import admin, messages
 from django.urls import reverse
 from django.utils.html import format_html
+from django.utils.safestring import mark_safe
 from django.http import HttpResponseRedirect
 from .models import Template, FigmaImportJob, Element
 
@@ -132,18 +133,20 @@ class TemplateAdmin(admin.ModelAdmin):
     )
 
     def import_status_display(self, obj):
-        data = obj.template_data
+        if not obj or not getattr(obj, 'pk', None):
+            return "Empty (Draft)"
+        data = getattr(obj, 'template_data', {})
         elements = data.get('elements', []) if isinstance(data, dict) else []
         if elements:
             return format_html('<span style="color: #166534; font-weight: 600;">✅ Ready ({} layers)</span>', len(elements))
         
         # Check if there is an active FigmaImportJob for this template
-        job = FigmaImportJob.objects.filter(template=obj).order_by('-created_at').first()
+        job = FigmaImportJob.objects.filter(template_id=obj.pk).order_by('-created_at').first()
         if job:
             if job.status == 'processing':
-                return format_html('<span style="color: #1e40af; font-weight: 600;">⚙️ Importing...</span>')
+                return mark_safe('<span style="color: #1e40af; font-weight: 600;">⚙️ Importing...</span>')
             elif job.status == 'pending':
-                return format_html('<span style="color: #854d0e; font-weight: 600;">⏳ Queued...</span>')
+                return mark_safe('<span style="color: #854d0e; font-weight: 600;">⏳ Queued...</span>')
             elif job.status == 'failed':
                 return format_html('<span style="color: #991b1b; font-weight: 600;" title="{}">❌ Import Failed</span>', job.error_message or '')
         
@@ -233,18 +236,23 @@ class FigmaImportJobAdmin(admin.ModelAdmin):
         )
         if obj.status in ('pending', 'processing'):
             badge_html += '<script>if(!window._figma_refresher){window._figma_refresher=setTimeout(function(){location.reload();}, 4000);}</script>'
-        return format_html(badge_html)
+        return mark_safe(badge_html)
     status_badge.short_description = "Status"
 
     def template_link(self, obj):
-        if obj.template:
-            admin_url = reverse('admin:editorapp_template_change', args=[obj.template.id])
-            editor_url = f"/editor/{obj.template.slug}"
-            return format_html(
-                '<a href="{}" style="font-weight: 500;">{}</a> '
-                '<a href="{}" target="_blank" style="margin-left: 8px; color: #4f46e5; text-decoration: none; font-weight: 600;">🎨 Open Editor &rarr;</a>',
-                admin_url, obj.template.name, editor_url
-            )
+        if getattr(obj, 'template_id', None):
+            try:
+                template = obj.template
+                if template:
+                    admin_url = reverse('admin:editorapp_template_change', args=[template.id])
+                    editor_url = f"/editor/{template.slug or template.id}"
+                    return format_html(
+                        '<a href="{}" style="font-weight: 500;">{}</a> '
+                        '<a href="{}" target="_blank" style="margin-left: 8px; color: #4f46e5; text-decoration: none; font-weight: 600;">🎨 Open Editor &rarr;</a>',
+                        admin_url, template.name or f"Template #{template.id}", editor_url
+                    )
+            except Exception:
+                return "-"
         return "-"
     template_link.short_description = "Generated Template"
 
