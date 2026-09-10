@@ -1,8 +1,19 @@
 import base64
 import io
-import numpy as np
-import cv2
-from PIL import Image
+try:
+    import numpy as np
+    import cv2
+    HAS_CV = True
+except ImportError:
+    np = None
+    cv2 = None
+    HAS_CV = False
+
+try:
+    from PIL import Image
+except ImportError:
+    Image = None
+
 from rest_framework.decorators import api_view
 from rest_framework.response import Response
 from rest_framework import status
@@ -122,6 +133,9 @@ def remove_background_view(request):
     """
     Canva / Adobe Express Quality AI Background Removal Endpoint.
     """
+    if not HAS_CV:
+        return Response({'error': 'Computer vision libraries (numpy/cv2) are not installed in the active environment.'}, status=status.HTTP_503_SERVICE_UNAVAILABLE)
+
     try:
         data = request.data
         image_data = data.get('image')

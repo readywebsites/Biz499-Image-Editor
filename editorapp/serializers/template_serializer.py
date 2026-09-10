@@ -46,7 +46,7 @@ class TemplateSerializer(serializers.ModelSerializer):
 
     def to_representation(self, instance):
         request = self.context.get('request')
-        session_id = request.query_params.get('session_id') if request else None
+        session_id = getattr(request, 'query_params', getattr(request, 'GET', {})).get('session_id') if request else None
         
         template_data = None
         if session_id:

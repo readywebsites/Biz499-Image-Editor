@@ -38,8 +38,8 @@ def system_diagnostics_view(request):
         db_status = f'DB Error: {e}'
 
     token = os.getenv('FIGMA_API_TOKEN') or getattr(settings, 'FIGMA_API_TOKEN', None)
-    if token:
-        token_preview = f'{token[:6]}...{token[-4:]} (length {len(token)})'
+    if token and token != "your_figma_api_token_here":
+        token_preview = f'Configured (length {len(token)})'
     else:
         token_preview = 'NOT CONFIGURED'
 

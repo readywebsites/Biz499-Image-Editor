@@ -1,6 +1,13 @@
 import base64
-import cv2
-import numpy as np
+try:
+    import cv2
+    import numpy as np
+    HAS_CV = True
+except ImportError:
+    cv2 = None
+    np = None
+    HAS_CV = False
+
 from rest_framework.decorators import api_view
 from rest_framework.response import Response
 from rest_framework import status
@@ -18,6 +25,9 @@ def magic_erase_view(request):
     3. If the selected object (e.g., text line, logo, stain) is INSIDE a solid foreground subject (card/product):
        -> Inpaints the texture seamlessly using the surrounding card surface without altering transparency.
     """
+    if not HAS_CV:
+        return Response({'error': 'Computer vision libraries (numpy/cv2) are not installed in the active environment.'}, status=status.HTTP_503_SERVICE_UNAVAILABLE)
+
     try:
         data = request.data
         image_data = data.get('image')

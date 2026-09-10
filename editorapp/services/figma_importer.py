@@ -46,9 +46,45 @@ class FigmaImporter:
         """
         file_key, node_id = self.parse_figma_url(url)
         if not file_key:
-            raise ValueError("Could not extract a valid Figma File Key from the provided URL.")
+            raise ValueError("Invalid Figma URL: Could not extract a valid Figma File Key from the provided URL.")
 
         logger.info(f"Importing Figma template '{template_name}' from file '{file_key}' (node-id: '{node_id}')...")
+
+        # Check if local mock test key is specified for credential-free testing
+        if file_key == 'mock_file_key':
+            logger.info("Mock file key detected. Loading local template bundle...")
+            bundle_dir = os.path.join(os.path.dirname(settings.BASE_DIR), 'template_bundle')
+            if not os.path.exists(bundle_dir):
+                bundle_dir = os.path.join(settings.BASE_DIR, '..', 'template_bundle')
+            bundle_json = os.path.join(bundle_dir, 'template.json')
+            if os.path.exists(bundle_json):
+                with open(bundle_json, 'r', encoding='utf-8') as f:
+                    template_data = json.load(f)
+                
+                # Copy bundle assets to media
+                figma_images_dir = os.path.join(settings.MEDIA_ROOT, 'figma_images')
+                templates_dir = os.path.join(settings.MEDIA_ROOT, 'template_backgrounds')
+                os.makedirs(figma_images_dir, exist_ok=True)
+                os.makedirs(templates_dir, exist_ok=True)
+
+                import shutil
+                for fname in os.listdir(bundle_dir):
+                    src_f = os.path.join(bundle_dir, fname)
+                    if os.path.isfile(src_f) and fname != 'template.json':
+                        shutil.copyfile(src_f, os.path.join(figma_images_dir, fname))
+
+                bg_src = os.path.join(bundle_dir, 'background.png')
+                bg_name = f"mock_{file_key}_bg.png"
+                if os.path.exists(bg_src):
+                    shutil.copyfile(bg_src, os.path.join(templates_dir, bg_name))
+
+                return {
+                    "name": template_name,
+                    "template_data": template_data,
+                    "background_image_path": f"template_backgrounds/{bg_name}",
+                    "width": template_data.get('width', 2000),
+                    "height": template_data.get('height', 2000),
+                }
 
         figma_service = FigmaService(api_token=api_token)
 

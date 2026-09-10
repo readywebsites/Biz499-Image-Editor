@@ -56,17 +56,6 @@ class Template(models.Model):
                 counter += 1
             self.slug = slug
 
-        # Check if figma_url has changed to avoid unnecessary API requests and overwrites
-        figma_url_changed = False
-        if self.pk:
-            try:
-                orig = Template.objects.get(pk=self.pk)
-                figma_url_changed = orig.figma_url != self.figma_url
-            except Template.DoesNotExist:
-                figma_url_changed = bool(self.figma_url)
-        else:
-            figma_url_changed = bool(self.figma_url)
-
         # Ensure template_data is parsed if provided as a JSON string
         if isinstance(self.template_data, str):
             try:
@@ -76,25 +65,6 @@ class Template(models.Model):
                 self.template_data = {}
         elif not isinstance(self.template_data, dict):
             self.template_data = {}
-
-        has_elements = bool(self.template_data.get('elements'))
-
-        if figma_url_changed and self.figma_url and not has_elements:
-            try:
-                from .services.figma_importer import FigmaImporter
-                importer = FigmaImporter()
-                result = importer.import_from_url(self.figma_url, self.name)
-                
-                self.template_data = result['template_data']
-                self.background_image = result['background_image_path']
-                self.width = result['width']
-                self.height = result['height']
-            except Exception as e:
-                import logging
-                logger = logging.getLogger(__name__)
-                logger.warning(f"Auto-import from Figma URL skipped or failed: {e}")
-                if not self.template_data:
-                    self.template_data = {}
 
         super().save(*args, **kwargs)
 

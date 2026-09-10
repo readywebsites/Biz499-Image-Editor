@@ -78,41 +78,11 @@ class TemplateAdminForm(forms.ModelForm):
             settings.FIGMA_API_TOKEN = clean_token
 
         figma_url = cleaned_data.get('figma_url')
-        name = cleaned_data.get('name') or "Figma Template"
-
-        # Check if figma_url is new or changed
-        figma_url_changed = False
-        if self.instance and self.instance.pk:
-            orig = Template.objects.filter(pk=self.instance.pk).first()
-            figma_url_changed = orig and orig.figma_url != figma_url
-        else:
-            figma_url_changed = bool(figma_url)
-
-        if figma_url and figma_url_changed:
+        if figma_url:
             from .services.figma_importer import FigmaImporter
-            file_key, node_id = FigmaImporter.parse_figma_url(figma_url)
+            file_key, _ = FigmaImporter.parse_figma_url(figma_url)
             if not file_key:
                 self.add_error('figma_url', "Could not extract a valid Figma File Key from the URL. Please check your link.")
-            else:
-                try:
-                    importer = FigmaImporter()
-                    result = importer.import_from_url(figma_url, name, api_token=token or None)
-                    
-                    cleaned_data['template_data'] = result['template_data']
-                    cleaned_data['background_image'] = result['background_image_path']
-                    cleaned_data['width'] = result['width']
-                    cleaned_data['height'] = result['height']
-                    
-                    self.instance.template_data = result['template_data']
-                    self.instance.background_image = result['background_image_path']
-                    self.instance.width = result['width']
-                    self.instance.height = result['height']
-                    
-                    self._import_succeeded = True
-                    self._element_count = len(result['template_data'].get('elements', []))
-                except Exception as e:
-                    logger.warning(f"Figma auto-import validation failed: {e}")
-                    self.add_error('figma_url', f"Figma Auto-Import Failed: {e}")
 
         # Ensure template_data defaults to an empty dict if not set
         if not cleaned_data.get('template_data'):
@@ -130,7 +100,7 @@ class ElementAdmin(admin.ModelAdmin):
 @admin.register(Template)
 class TemplateAdmin(admin.ModelAdmin):
     form = TemplateAdminForm
-    list_display = ('name', 'category', 'status', 'element_count_display', 'width', 'height', 'created_at', 'updated_at')
+    list_display = ('name', 'category', 'status', 'import_status_display', 'width', 'height', 'created_at', 'updated_at')
     list_filter = ('status', 'category')
     search_fields = ('name', 'description', 'figma_url')
     prepopulated_fields = {'slug': ('name',)}
@@ -161,30 +131,47 @@ class TemplateAdmin(admin.ModelAdmin):
         })
     )
 
-    def element_count_display(self, obj):
+    def import_status_display(self, obj):
         data = obj.template_data
-        if isinstance(data, str):
-            try:
-                import json
-                data = json.loads(data)
-            except Exception:
-                data = {}
-        elif not isinstance(data, dict):
-            data = {}
         elements = data.get('elements', []) if isinstance(data, dict) else []
-        return f"{len(elements)} elements"
-    element_count_display.short_description = "Layers"
+        if elements:
+            return format_html('<span style="color: #166534; font-weight: 600;">✅ Ready ({} layers)</span>', len(elements))
+        
+        # Check if there is an active FigmaImportJob for this template
+        job = FigmaImportJob.objects.filter(template=obj).order_by('-created_at').first()
+        if job:
+            if job.status == 'processing':
+                return format_html('<span style="color: #1e40af; font-weight: 600;">⚙️ Importing...</span>')
+            elif job.status == 'pending':
+                return format_html('<span style="color: #854d0e; font-weight: 600;">⏳ Queued...</span>')
+            elif job.status == 'failed':
+                return format_html('<span style="color: #991b1b; font-weight: 600;" title="{}">❌ Import Failed</span>', job.error_message or '')
+        
+        return "Empty (Draft)"
+    import_status_display.short_description = "Content / Layers"
 
     def save_model(self, request, obj, form, change):
         super().save_model(request, obj, form, change)
 
-        if getattr(form, '_import_succeeded', False):
-            count = getattr(form, '_element_count', len(obj.template_data.get('elements', [])))
-            messages.success(
-                request,
-                f"🎉 Successfully imported Figma design '{obj.name}' with {count} editable elements! "
-                "All vector SVGs, photos, typography, and background have been saved and are ready in the editor."
-            )
+        # Non-blocking: If figma_url is provided and template has no elements, trigger background import
+        has_elements = bool(obj.template_data and obj.template_data.get('elements'))
+        if obj.figma_url and not has_elements:
+            from .services.figma_runner import start_figma_import_background
+            active_job = FigmaImportJob.objects.filter(template=obj, status__in=['pending', 'processing']).first()
+            if not active_job:
+                job = FigmaImportJob.objects.create(
+                    name=obj.name,
+                    figma_url=obj.figma_url,
+                    status='pending',
+                    template=obj
+                )
+                start_figma_import_background(job.id)
+                messages.info(
+                    request,
+                    f"🚀 Figma import for '{obj.name}' has started in the background. "
+                    "All editable layers and assets are being downloaded and will appear once completed. "
+                    "You can track progress in Figma Import Jobs."
+                )
 
 class FigmaImportJobForm(forms.ModelForm):
     figma_api_token = forms.CharField(
@@ -205,12 +192,19 @@ class FigmaImportJobForm(forms.ModelForm):
             update_figma_token_in_env(clean_token)
             os.environ['FIGMA_API_TOKEN'] = clean_token
             settings.FIGMA_API_TOKEN = clean_token
+
+        figma_url = cleaned_data.get('figma_url')
+        if figma_url:
+            from .services.figma_importer import FigmaImporter
+            file_key, _ = FigmaImporter.parse_figma_url(figma_url)
+            if not file_key:
+                self.add_error('figma_url', "Could not extract a valid Figma File Key from the URL. Please check your link.")
         return cleaned_data
 
 @admin.register(FigmaImportJob)
 class FigmaImportJobAdmin(admin.ModelAdmin):
     form = FigmaImportJobForm
-    list_display = ('name', 'status', 'created_at', 'template')
+    list_display = ('name', 'status_badge', 'template_link', 'error_summary', 'created_at')
     list_filter = ('status',)
     readonly_fields = ('status', 'error_message', 'template', 'created_at', 'updated_at')
     search_fields = ('name', 'figma_url')
@@ -221,52 +215,66 @@ class FigmaImportJobAdmin(admin.ModelAdmin):
             'fields': ('name', 'figma_url', 'figma_api_token')
         }),
         ('Job Status', {
-            'classes': ('collapse',),
             'fields': readonly_fields,
         }),
     )
 
+    def status_badge(self, obj):
+        status_colors = {
+            'pending': ('#fef08a', '#854d0e', '⏳ Pending'),
+            'processing': ('#bfdbfe', '#1e40af', '⚙️ Processing...'),
+            'completed': ('#bbf7d0', '#166534', '✅ Completed'),
+            'failed': ('#fecaca', '#991b1b', '❌ Failed'),
+        }
+        bg, color, text = status_colors.get(obj.status, ('#e2e8f0', '#334155', obj.status.title()))
+        badge_html = (
+            f'<span style="background: {bg}; color: {color}; padding: 3px 10px; '
+            f'border-radius: 9999px; font-weight: 600; font-size: 12px; display: inline-block;">{text}</span>'
+        )
+        if obj.status in ('pending', 'processing'):
+            badge_html += '<script>if(!window._figma_refresher){window._figma_refresher=setTimeout(function(){location.reload();}, 4000);}</script>'
+        return format_html(badge_html)
+    status_badge.short_description = "Status"
+
+    def template_link(self, obj):
+        if obj.template:
+            admin_url = reverse('admin:editorapp_template_change', args=[obj.template.id])
+            editor_url = f"/editor/{obj.template.slug}"
+            return format_html(
+                '<a href="{}" style="font-weight: 500;">{}</a> '
+                '<a href="{}" target="_blank" style="margin-left: 8px; color: #4f46e5; text-decoration: none; font-weight: 600;">🎨 Open Editor &rarr;</a>',
+                admin_url, obj.template.name, editor_url
+            )
+        return "-"
+    template_link.short_description = "Generated Template"
+
+    def error_summary(self, obj):
+        if not obj.error_message:
+            return "-"
+        msg = obj.error_message
+        preview = msg[:80] + ("..." if len(msg) > 80 else "")
+        return format_html('<span style="color: #dc2626; font-size: 12px;" title="{}">{}</span>', msg, preview)
+    error_summary.short_description = "Error Details"
+
     def save_model(self, request, obj, form, change):
-        if change:
+        if change and obj.status == 'failed':
             obj.status = 'pending'
-            obj.template = None
             obj.error_message = None
+        elif not change:
+            obj.status = 'pending'
         
         super().save_model(request, obj, form, change)
 
-        # Process import
-        try:
-            token = form.cleaned_data.get('figma_api_token') if form else None
-            from .services.figma_importer import FigmaImporter
-            importer = FigmaImporter()
-            result = importer.import_from_url(obj.figma_url, obj.name, api_token=token or None)
+        # Trigger background processing immediately without blocking the request
+        from .services.figma_runner import start_figma_import_background
+        start_figma_import_background(obj.id)
 
-            template = Template.objects.create(
-                name=obj.name,
-                figma_url=obj.figma_url,
-                template_data=result['template_data'],
-                background_image=result['background_image_path'],
-                width=result['width'],
-                height=result['height'],
-                status='published'
-            )
-
-            obj.status = 'completed'
-            obj.template = template
-            obj.error_message = None
-            obj.save()
-
-            element_count = len(result['template_data'].get('elements', []))
-            messages.success(
-                request,
-                f"🎉 Figma import job completed! Template '{template.name}' created with {element_count} editable elements."
-            )
-        except Exception as e:
-            obj.status = 'failed'
-            obj.error_message = str(e)
-            obj.save()
-            logger.error(f"FigmaImportJob failed: {e}", exc_info=True)
-            messages.error(request, f"Figma Import Failed: {e}")
+        messages.info(
+            request,
+            f"🚀 Figma import job '{obj.name}' has been started in the background. "
+            "The status will update automatically once completed."
+        )
 
     def response_add(self, request, obj, post_url_continue=None):
         return HttpResponseRedirect(reverse('admin:editorapp_figmaimportjob_changelist'))
+
