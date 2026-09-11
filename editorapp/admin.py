@@ -153,6 +153,31 @@ class TemplateAdmin(admin.ModelAdmin):
         return "Empty (Draft)"
     import_status_display.short_description = "Content / Layers"
 
+    actions = ['retry_figma_import']
+
+    @admin.action(description="🔄 Re-import selected templates from Figma")
+    def retry_figma_import(self, request, queryset):
+        from .services.figma_runner import start_figma_import_background
+        dispatched = 0
+        for tpl in queryset:
+            if tpl.figma_url:
+                job = FigmaImportJob.objects.filter(template=tpl).order_by('-created_at').first()
+                if not job or job.status != 'processing':
+                    if not job:
+                        job = FigmaImportJob.objects.create(
+                            name=tpl.name,
+                            figma_url=tpl.figma_url,
+                            status='pending',
+                            template=tpl
+                        )
+                    else:
+                        job.status = 'pending'
+                        job.error_message = None
+                        job.save()
+                    start_figma_import_background(job.id)
+                    dispatched += 1
+        messages.info(request, f"🚀 Dispatched background Figma import for {dispatched} template(s).")
+
     def save_model(self, request, obj, form, change):
         super().save_model(request, obj, form, change)
 
@@ -160,15 +185,25 @@ class TemplateAdmin(admin.ModelAdmin):
         has_elements = bool(obj.template_data and obj.template_data.get('elements'))
         if obj.figma_url and not has_elements:
             from .services.figma_runner import start_figma_import_background
-            active_job = FigmaImportJob.objects.filter(template=obj, status__in=['pending', 'processing']).first()
+            active_job = FigmaImportJob.objects.filter(template=obj, status='processing').first()
             if not active_job:
-                job = FigmaImportJob.objects.create(
-                    name=obj.name,
-                    figma_url=obj.figma_url,
-                    status='pending',
-                    template=obj
-                )
-                start_figma_import_background(job.id)
+                # Find any pending or failed job for this template, or create new
+                existing_job = FigmaImportJob.objects.filter(template=obj).order_by('-created_at').first()
+                if existing_job and existing_job.status in ('pending', 'failed'):
+                    existing_job.name = obj.name
+                    existing_job.figma_url = obj.figma_url
+                    existing_job.status = 'pending'
+                    existing_job.error_message = None
+                    existing_job.save()
+                    start_figma_import_background(existing_job.id)
+                else:
+                    job = FigmaImportJob.objects.create(
+                        name=obj.name,
+                        figma_url=obj.figma_url,
+                        status='pending',
+                        template=obj
+                    )
+                    start_figma_import_background(job.id)
                 messages.info(
                     request,
                     f"🚀 Figma import for '{obj.name}' has started in the background. "
@@ -207,11 +242,25 @@ class FigmaImportJobForm(forms.ModelForm):
 @admin.register(FigmaImportJob)
 class FigmaImportJobAdmin(admin.ModelAdmin):
     form = FigmaImportJobForm
+    actions = ['retry_selected_jobs']
     list_display = ('name', 'status_badge', 'template_link', 'error_summary', 'created_at')
     list_filter = ('status',)
     readonly_fields = ('status', 'error_message', 'template', 'created_at', 'updated_at')
     search_fields = ('name', 'figma_url')
     ordering = ('-created_at',)
+
+    @admin.action(description="🔄 Retry selected Figma import jobs")
+    def retry_selected_jobs(self, request, queryset):
+        from .services.figma_runner import start_figma_import_background
+        dispatched = 0
+        for job in queryset:
+            if job.status != 'processing':
+                job.status = 'pending'
+                job.error_message = None
+                job.save()
+                start_figma_import_background(job.id)
+                dispatched += 1
+        messages.info(request, f"🚀 Re-dispatched {dispatched} job(s) in background.")
 
     fieldsets = (
         (None, {

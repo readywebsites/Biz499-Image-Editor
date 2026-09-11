@@ -35,26 +35,32 @@ def process_figma_job(job_id):
     from editorapp.models import FigmaImportJob, Template
     from editorapp.services.figma_importer import FigmaImporter
 
-    connections.close_all()
-    
-    # Retry on transient sqlite lock
+    # Retry with backoff to ensure database transaction is fully visible
     job = None
-    for attempt in range(5):
+    for attempt in range(10):
         try:
             job = FigmaImportJob.objects.filter(id=job_id).first()
-            break
+            if job:
+                break
         except OperationalError:
-            if attempt < 4:
-                time.sleep(0.3)
-            else:
-                raise
+            pass
+        time.sleep(0.5)
 
     if not job:
-        logger.warning(f"FigmaImportJob ID {job_id} not found.")
+        logger.warning(f"FigmaImportJob ID {job_id} not found after retrying.")
         return
 
-    if job.status in ('processing', 'completed'):
-        logger.info(f"FigmaImportJob ID {job_id} is already in state '{job.status}'. Skipping duplicate execution.")
+    if job.status == 'processing':
+        # Allow recovery if a previous worker crashed and job has been stuck for >10m
+        from django.utils import timezone
+        import datetime
+        stale_threshold = timezone.now() - datetime.timedelta(minutes=10)
+        if job.updated_at and job.updated_at > stale_threshold:
+            logger.info(f"FigmaImportJob ID {job_id} is already actively processing. Skipping duplicate execution.")
+            return
+        logger.warning(f"FigmaImportJob ID {job_id} was stuck in 'processing' for >10 minutes. Resuming execution.")
+    elif job.status == 'completed':
+        logger.info(f"FigmaImportJob ID {job_id} is already completed. Skipping duplicate execution.")
         return
 
     try:
@@ -124,14 +130,24 @@ def process_figma_job(job_id):
 def start_figma_import_background(job_id):
     """
     Dispatches a Figma import job to run in a background daemon thread.
-    Returns immediately without blocking the caller (e.g. Django Admin or REST API).
+    Ensures thread starts AFTER the database transaction commits so the job row
+    is visible and not locked by the creating connection.
     """
-    thread = threading.Thread(
-        target=process_figma_job,
-        args=(job_id,),
-        daemon=True,
-        name=f"figma-import-job-{job_id}"
-    )
-    thread.start()
-    logger.info(f"Dispatched Figma import job ID {job_id} to background thread '{thread.name}'.")
-    return thread
+    from django.db import transaction
+
+    def _launch():
+        thread = threading.Thread(
+            target=process_figma_job,
+            args=(job_id,),
+            daemon=True,
+            name=f"figma-import-job-{job_id}"
+        )
+        thread.start()
+        logger.info(f"Dispatched Figma import job ID {job_id} to background thread '{thread.name}'.")
+        return thread
+
+    try:
+        transaction.on_commit(_launch)
+    except Exception:
+        return _launch()
+

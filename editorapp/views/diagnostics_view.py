@@ -38,8 +38,21 @@ def system_diagnostics_view(request):
         db_status = f'DB Error: {e}'
 
     token = os.getenv('FIGMA_API_TOKEN') or getattr(settings, 'FIGMA_API_TOKEN', None)
+    token_status = 'NOT CONFIGURED'
     if token and token != "your_figma_api_token_here":
-        token_preview = f'Configured (length {len(token)})'
+        clean_tok = token.strip().strip('"\'')
+        token_preview = f'Configured (length {len(clean_tok)})'
+        try:
+            import requests
+            r = requests.get('https://api.figma.com/v1/me', headers={'X-Figma-Token': clean_tok}, timeout=3)
+            if r.status_code == 200:
+                user_info = r.json()
+                token_status = f"VALID - Account: {user_info.get('email') or user_info.get('handle')}"
+            else:
+                err_text = r.json().get('err') or r.text
+                token_status = f"INVALID/EXPIRED ({r.status_code}): {err_text}"
+        except Exception as te:
+            token_status = f"CHECK ERROR: {te}"
     else:
         token_preview = 'NOT CONFIGURED'
 
@@ -49,5 +62,7 @@ def system_diagnostics_view(request):
         'python_version': sys.version,
         'db_status': db_status,
         'figma_token': token_preview,
+        'figma_token_health': token_status,
         'recent_errors': [l.strip() for l in error_log_lines if l.strip()],
     }, json_dumps_params={'indent': 2})
+
