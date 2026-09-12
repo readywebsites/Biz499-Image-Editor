@@ -178,7 +178,7 @@ class FigmaService:
                 time.sleep(0.5)
         return result
 
-    def export_nodes_as_png(self, file_key, node_ids, scale=1, chunk_size=30):
+    def export_nodes_as_png(self, file_key, node_ids, scale=1, chunk_size=30, use_absolute_bounds=False):
         """Batch exports nodes (frames, masked groups, images) as PNG."""
         if not node_ids:
             return {}
@@ -190,8 +190,9 @@ class FigmaService:
                 "ids": ",".join(chunk),
                 "format": "png",
                 "scale": str(scale),
-                "use_absolute_bounds": "true"
             }
+            if use_absolute_bounds:
+                params["use_absolute_bounds"] = "true"
             logger.info(f"Exporting batch of {len(chunk)} PNG nodes: GET {url}")
 
             def _fetch():

@@ -60,11 +60,42 @@ def get_node_rotation(node):
             pass
     return 0.0
 
+def get_svg_dimensions(svg_path):
+    """Extracts width and height from an SVG file's attributes or viewBox."""
+    try:
+        import xml.etree.ElementTree as ET
+        tree = ET.parse(svg_path)
+        root = tree.getroot()
+        w = root.get('width')
+        h = root.get('height')
+        viewbox = root.get('viewBox')
+        if w and h:
+            w_val = float(re.sub(r'[^\d.]', '', w))
+            h_val = float(re.sub(r'[^\d.]', '', h))
+            return w_val, h_val
+        elif viewbox:
+            parts = [float(p) for p in viewbox.split()]
+            if len(parts) == 4:
+                return parts[2], parts[3]
+    except Exception as e:
+        logger.warning(f"Failed to parse SVG dimensions from {svg_path}: {e}")
+    return None, None
+
 def is_mask_group(node):
-    """Checks if a group or frame contains a mask layer as a child."""
-    if node.get("type") in ("FRAME", "GROUP", "COMPONENT", "INSTANCE", "BOOLEAN_OPERATION"):
+    """Checks if a group or frame contains a mask layer as a child or is explicitly a mask group."""
+    if not isinstance(node, dict):
+        return False
+    name = (node.get("name") or "").strip().lower()
+    if "mask group" in name or "clip path group" in name:
+        return True
+    if node.get("isMask") is True:
+        return True
+    if node.get("type") in ("FRAME", "GROUP", "COMPONENT", "INSTANCE", "BOOLEAN_OPERATION", "SECTION"):
         for child in node.get("children", []):
-            if child.get("isMask") is True:
+            if child.get("isMask") is True or child.get("maskType") is not None:
+                return True
+            child_name = (child.get("name") or "").strip().lower()
+            if child_name.startswith("mask") or child_name.startswith("clip path"):
                 return True
     return False
 
@@ -236,24 +267,63 @@ class FigmaConverter:
                 if is_mask_group(node):
                     filename = f"masked_group_{clean_id}.png"
                     png_export_nodes.append((node.get("id"), clean_id, filename))
+
+                    # For a mask group, the visible bounds are defined by the mask layer
+                    mask_child = None
+                    for c in node.get("children", []):
+                        if c.get("isMask") or c.get("maskType") is not None or "mask" in (c.get("name") or "").lower():
+                            mask_child = c
+                            break
+                    if not mask_child and node.get("children"):
+                        mask_child = node["children"][0]
+
+                    m_bbox = mask_child.get("absoluteBoundingBox", {}) if mask_child else bbox
+                    m_x = round(m_bbox.get("x", bbox.get("x", 0.0)) - frame_x, 2)
+                    m_y = round(m_bbox.get("y", bbox.get("y", 0.0)) - frame_y, 2)
+                    m_w = round(m_bbox.get("width", node_w), 2)
+                    m_h = round(m_bbox.get("height", node_h), 2)
+
                     elements.append({
                         "id": node.get("id"),
                         "name": node.get("name", "Mask Group"),
                         "type": "IMAGE",
-                        "x": node_x,
-                        "y": node_y,
-                        "width": node_w,
-                        "height": node_h,
+                        "x": m_x,
+                        "y": m_y,
+                        "width": m_w,
+                        "height": m_h,
                         "rotation": rotation,
                         "opacity": opacity,
                         "visible": True,
                         "imageFileName": filename,
-                        "src": f"{settings.MEDIA_URL}figma_images/{filename}"
+                        "src": f"{settings.MEDIA_URL}figma_images/{filename}",
+                        "_is_mask_group": True
                     })
                     return  # Stop recursion into mask group contents
 
                 # B. System Icon: Name contains a colon (e.g. 'ic:round-business-center')
                 if is_icon_node(node):
+                    icon_color = None
+                    if node.get("fills"):
+                        icon_color = solid_fill_to_hex(node.get("fills"))
+                    if (not icon_color or icon_color == "#000000") and node.get("strokes"):
+                        stroke_c = solid_fill_to_hex(node.get("strokes"))
+                        if stroke_c:
+                            icon_color = stroke_c
+                    if not icon_color or icon_color == "#000000":
+                        for c in node.get("children", []):
+                            if c.get("fills"):
+                                c_color = solid_fill_to_hex(c.get("fills"))
+                                if c_color and c_color != "#000000":
+                                    icon_color = c_color
+                                    break
+                            if c.get("strokes"):
+                                c_color = solid_fill_to_hex(c.get("strokes"))
+                                if c_color and c_color != "#000000":
+                                    icon_color = c_color
+                                    break
+                    if not icon_color:
+                        icon_color = "#ffffff" if ("business-center" in node.get("name", "") or "white" in node.get("name", "").lower()) else "#000000"
+
                     elements.append({
                         "id": node.get("id"),
                         "name": node.get("name"),
@@ -264,7 +334,8 @@ class FigmaConverter:
                         "height": node_h,
                         "rotation": rotation,
                         "opacity": opacity,
-                        "visible": True
+                        "visible": True,
+                        "color": icon_color
                     })
                     return
 
@@ -448,12 +519,39 @@ class FigmaConverter:
             except Exception as e:
                 logger.error(f"Batch SVG export failed: {e}", exc_info=True)
 
+            # Adjust vector element bounds according to downloaded SVG viewBox / frame intersection
+            for el in elements:
+                if el.get("type") == "IMAGE" and el.get("imageFileName", "").endswith(".svg"):
+                    svg_dest = os.path.join(figma_images_dir, el["imageFileName"])
+                    if os.path.exists(svg_dest):
+                        svg_w, svg_h = get_svg_dimensions(svg_dest)
+                        if svg_w and svg_h:
+                            inter_x = max(0.0, el["x"])
+                            inter_y = max(0.0, el["y"])
+                            inter_w = max(0.0, min(float(frame_w), el["x"] + el["width"]) - inter_x)
+                            inter_h = max(0.0, min(float(frame_h), el["y"] + el["height"]) - inter_y)
+
+                            if abs(svg_w - inter_w) < 2 and abs(svg_h - inter_h) < 2:
+                                el["x"] = round(inter_x, 2)
+                                el["y"] = round(inter_y, 2)
+                            elif abs(svg_w - inter_w) < 2:
+                                el["x"] = round(inter_x, 2)
+                            elif abs(svg_h - inter_h) < 2:
+                                el["y"] = round(inter_y, 2)
+                            else:
+                                if el["x"] < 0 and abs(svg_w - frame_w) < 2:
+                                    el["x"] = 0.0
+                                if el["y"] < 0 and abs(svg_h - frame_h) < 2:
+                                    el["y"] = 0.0
+                            el["width"] = round(svg_w, 2)
+                            el["height"] = round(svg_h, 2)
+
         # 5. Batch export and download PNGs (masked groups, flattened layers)
         if png_export_nodes:
             png_ids = [item[0] for item in png_export_nodes]
             id_to_filename = {item[0]: item[2] for item in png_export_nodes}
             try:
-                png_urls = self.figma_service.export_nodes_as_png(self.file_key, png_ids, scale=1)
+                png_urls = self.figma_service.export_nodes_as_png(self.file_key, png_ids, scale=1, use_absolute_bounds=False)
                 for nid, url in png_urls.items():
                     if url and nid in id_to_filename:
                         dest = os.path.join(figma_images_dir, id_to_filename[nid])
@@ -467,6 +565,39 @@ class FigmaConverter:
                             logger.warning(f"Failed to download PNG for node {nid}: {e}")
             except Exception as e:
                 logger.error(f"Batch PNG export failed: {e}", exc_info=True)
+
+            # Adjust raster and masked group bounds according to downloaded PNG dimensions
+            for el in elements:
+                if el.get("type") == "IMAGE" and el.get("imageFileName", "").endswith(".png"):
+                    png_dest = os.path.join(figma_images_dir, el["imageFileName"])
+                    if os.path.exists(png_dest):
+                        try:
+                            with Image.open(png_dest) as img:
+                                png_w, png_h = img.size
+                            is_mask = el.pop("_is_mask_group", False)
+                            inter_x = max(0.0, el["x"])
+                            inter_y = max(0.0, el["y"])
+                            inter_w = max(0.0, min(float(frame_w), el["x"] + el["width"]) - inter_x)
+                            inter_h = max(0.0, min(float(frame_h), el["y"] + el["height"]) - inter_y)
+
+                            if is_mask:
+                                if abs(png_w - inter_w) < 2 and abs(png_h - inter_h) < 2:
+                                    el["x"] = round(inter_x, 2)
+                                    el["y"] = round(inter_y, 2)
+                                elif abs(png_h - inter_h) < 2 and el["y"] < 0:
+                                    el["y"] = round(inter_y, 2)
+                                elif el["x"] < 0 and abs(png_w - frame_w) < 2:
+                                    el["x"] = 0.0
+                            else:
+                                if el["x"] < 0 and abs(png_w - frame_w) < 2:
+                                    el["x"] = 0.0
+                                if el["y"] < 0 and abs(png_h - frame_h) < 2:
+                                    el["y"] = 0.0
+
+                            el["width"] = round(float(png_w), 2)
+                            el["height"] = round(float(png_h), 2)
+                        except Exception as e:
+                            logger.warning(f"Could not read PNG dimensions from {png_dest}: {e}")
 
         # 6. Download image fills from Figma image hash mapping
         if image_fill_nodes:
@@ -600,6 +731,10 @@ class FigmaConverter:
             shutil.copyfile(bg_local_path, figma_bg_dest)
         except Exception as e:
             logger.warning(f"Could not copy background.png to figma_images: {e}")
+
+        # Pop any remaining internal temporary flags
+        for el in elements:
+            el.pop("_is_mask_group", None)
 
         # 8. Assemble template_data
         template_data = {
