@@ -117,11 +117,12 @@ def is_mask_group(node):
     if "mask group" in name or "clip path group" in name:
         return True
 
-    # Real mask group in Figma: only small clusters (<= 6 children) with an isMask child
+    # Real mask group in Figma: must have an actual child where isMask == True
+    # (Note: In Figma API, every node has maskType='ALPHA' by default, so we only check isMask == True)
     children = node.get("children", [])
     if node_type in ("FRAME", "GROUP", "COMPONENT", "INSTANCE", "BOOLEAN_OPERATION"):
-        if children and len(children) <= 6:
-            has_mask_child = any(c.get("isMask") is True or c.get("maskType") is not None for c in children)
+        if children and len(children) <= 20:
+            has_mask_child = any(c.get("isMask") is True for c in children)
             if has_mask_child:
                 return True
 
@@ -135,6 +136,116 @@ def is_icon_node(node):
         if len(parts) == 2 and len(parts[0]) > 1 and len(parts[1]) > 1:
             return True
     return False
+
+def has_visible_fill(node):
+    """Checks if a node has any visible fills."""
+    fills = node.get("fills")
+    if isinstance(fills, list):
+        for f in fills:
+            if isinstance(f, dict) and f.get("visible", True) and f.get("opacity", 1.0) > 0:
+                return True
+    return False
+
+def has_visible_stroke(node):
+    """Checks if a node has any visible strokes."""
+    strokes = node.get("strokes")
+    if isinstance(strokes, list):
+        for s in strokes:
+            if isinstance(s, dict) and s.get("visible", True) and s.get("opacity", 1.0) > 0:
+                return True
+    return False
+
+def generate_container_svg(width, height, fills=None, strokes=None, stroke_weight=1, corner_radius=0, corner_radii=None):
+    """
+    Generates a clean SVG string for a container's background shape (rectangle/pill/card),
+    preserving exact corner radii, solid/gradient fills, and strokes without rendering child text.
+    """
+    w = max(1.0, float(width))
+    h = max(1.0, float(height))
+    
+    fill_attr = 'fill="none"'
+    defs = []
+    
+    if fills and isinstance(fills, list):
+        for fill in fills:
+            if not isinstance(fill, dict) or not fill.get("visible", True):
+                continue
+            fill_type = fill.get("type", "SOLID")
+            opacity = fill.get("opacity", 1.0)
+            
+            if fill_type == "SOLID":
+                c = fill.get("color", {})
+                r = int(round(c.get("r", 1) * 255))
+                g = int(round(c.get("g", 1) * 255))
+                b = int(round(c.get("b", 1) * 255))
+                hex_color = f"#{r:02x}{g:02x}{b:02x}"
+                if opacity < 0.999:
+                    fill_attr = f'fill="{hex_color}" fill-opacity="{opacity:.3f}"'
+                else:
+                    fill_attr = f'fill="{hex_color}"'
+                break
+            elif fill_type == "GRADIENT_LINEAR":
+                grad_id = f"grad_{abs(hash(str(fill)))}"
+                handles = fill.get("gradientHandlePositions", [{"x": 0, "y": 0}, {"x": 1, "y": 0}])
+                x1 = handles[0].get("x", 0) * 100
+                y1 = handles[0].get("y", 0) * 100
+                x2 = handles[1].get("x", 1) * 100
+                y2 = handles[1].get("y", 0) * 100
+                stops_xml = []
+                for stop in fill.get("gradientStops", []):
+                    sc = stop.get("color", {})
+                    sr = int(round(sc.get("r", 0) * 255))
+                    sg = int(round(sc.get("g", 0) * 255))
+                    sb = int(round(sc.get("b", 0) * 255))
+                    sa = sc.get("a", 1.0)
+                    pos = stop.get("position", 0) * 100
+                    stops_xml.append(f'<stop offset="{pos:.1f}%" stop-color="#{sr:02x}{sg:02x}{sb:02x}" stop-opacity="{sa:.3f}"/>')
+                defs.append(f'<linearGradient id="{grad_id}" x1="{x1:.1f}%" y1="{y1:.1f}%" x2="{x2:.1f}%" y2="{y2:.1f}%">{"".join(stops_xml)}</linearGradient>')
+                fill_attr = f'fill="url(#{grad_id})"'
+                break
+
+    stroke_attr = ''
+    if strokes and isinstance(strokes, list):
+        for stroke in strokes:
+            if not isinstance(stroke, dict) or not stroke.get("visible", True):
+                continue
+            if stroke.get("type") == "SOLID":
+                c = stroke.get("color", {})
+                r = int(round(c.get("r", 0) * 255))
+                g = int(round(c.get("g", 0) * 255))
+                b = int(round(c.get("b", 0) * 255))
+                hex_color = f"#{r:02x}{g:02x}{b:02x}"
+                s_op = stroke.get("opacity", 1.0)
+                sw = max(0.5, float(stroke_weight or 1))
+                if s_op < 0.999:
+                    stroke_attr = f' stroke="{hex_color}" stroke-width="{sw}" stroke-opacity="{s_op:.3f}"'
+                else:
+                    stroke_attr = f' stroke="{hex_color}" stroke-width="{sw}"'
+                break
+
+    defs_xml = f"<defs>{''.join(defs)}</defs>" if defs else ""
+
+    if corner_radii and len(corner_radii) == 4 and any(r > 0 for r in corner_radii):
+        tl, tr, br, bl = corner_radii
+        path_d = (
+            f"M {tl} 0 "
+            f"H {w - tr} "
+            f"A {tr} {tr} 0 0 1 {w} {tr} "
+            f"V {h - br} "
+            f"A {br} {br} 0 0 1 {w - br} {h} "
+            f"H {bl} "
+            f"A {bl} {bl} 0 0 1 0 {h - bl} "
+            f"V {tl} "
+            f"A {tl} {tl} 0 0 1 {tl} 0 Z"
+        )
+        shape_xml = f'<path d="{path_d}" {fill_attr}{stroke_attr}/>'
+    elif corner_radius and corner_radius > 0:
+        cr = min(corner_radius, min(w, h) / 2)
+        shape_xml = f'<rect width="{w}" height="{h}" rx="{cr}" ry="{cr}" {fill_attr}{stroke_attr}/>'
+    else:
+        shape_xml = f'<rect width="{w}" height="{h}" {fill_attr}{stroke_attr}/>'
+
+    return f'<svg width="{w}" height="{h}" viewBox="0 0 {w} {h}" fill="none" xmlns="http://www.w3.org/2000/svg">{defs_xml}{shape_xml}</svg>'
 
 def get_image_fill(node):
     """Returns the first visible IMAGE fill in a node's fills, if any."""
@@ -154,8 +265,9 @@ class FigmaConverter:
     """
 
     CUSTOM_VECTOR_TYPES = {
-        'VECTOR', 'BOOLEAN_OPERATION', 'STAR', 'LINE',
-        'ELLIPSE', 'POLYGON', 'REGULAR_POLYGON'
+        'VECTOR', 'BOOLEAN_OPERATION', 'BOOLEAN', 'STAR', 'LINE',
+        'ELLIPSE', 'POLYGON', 'REGULAR_POLYGON', 'SHAPE_WITH_TEXT',
+        'STAMP', 'HIGHLIGHT', 'WASHI_TAPE'
     }
 
     def __init__(self, figma_document, figma_service, file_key, target_node_id=None, template_name="Figma Template"):
@@ -278,6 +390,7 @@ class FigmaConverter:
         svg_export_nodes = []     # List of (node_id, clean_id, filename)
         png_export_nodes = []     # List of (node_id, clean_id, filename)
         image_fill_nodes = []     # List of (node_id, clean_id, filename, image_hash)
+        generated_svg_files = {}  # Map of filename -> svg_string
         bg_rect_candidate = None  # Full-bleed bottom rectangle candidate
 
         # 2. Bottom-to-top traversal of frame children
@@ -287,7 +400,7 @@ class FigmaConverter:
         if children and len(children) > 0:
             first_child = children[0]
             if first_child.get("type") == "RECTANGLE" and not get_image_fill(first_child):
-                c_bbox = first_child.get("absoluteBoundingBox") or {}
+                c_bbox = first_child.get("absoluteBoundingBox") or first_child.get("absoluteRenderBounds") or {}
                 cw = c_bbox.get("width", 0)
                 ch = c_bbox.get("height", 0)
                 cx = c_bbox.get("x", 0) - frame_x
@@ -302,13 +415,19 @@ class FigmaConverter:
                 return
 
             if not is_root:
-                # Skip the bottom background rectangle so it is not an overlapping editable layer
-                if bg_rect_candidate and node.get("id") == bg_rect_candidate.get("id"):
-                    return
+                bbox = node.get("absoluteBoundingBox") or node.get("absoluteRenderBounds") or {}
+                if "x" in bbox:
+                    node_x = round(bbox.get("x", 0.0) - frame_x, 2)
+                    node_y = round(bbox.get("y", 0.0) - frame_y, 2)
+                else:
+                    abs_transform = node.get("absoluteTransform")
+                    if abs_transform and len(abs_transform) >= 2 and len(abs_transform[0]) >= 3:
+                        node_x = round(float(abs_transform[0][2]) - frame_x, 2)
+                        node_y = round(float(abs_transform[1][2]) - frame_y, 2)
+                    else:
+                        node_x = round(float(node.get("x", 0.0)), 2)
+                        node_y = round(float(node.get("y", 0.0)), 2)
 
-                bbox = node.get("absoluteBoundingBox") or {}
-                node_x = round(bbox.get("x", 0.0) - frame_x, 2) if "x" in bbox else round(float(node.get("x", 0.0)), 2)
-                node_y = round(bbox.get("y", 0.0) - frame_y, 2) if "y" in bbox else round(float(node.get("y", 0.0)), 2)
                 node_w = round(bbox.get("width", node.get("width", 0.0)), 2)
                 node_h = round(bbox.get("height", node.get("height", 0.0)), 2)
                 rotation = get_node_rotation(node)
@@ -324,13 +443,13 @@ class FigmaConverter:
                     # For a mask group, the visible bounds are defined by the mask layer
                     mask_child = None
                     for c in node.get("children", []):
-                        if c.get("isMask") or c.get("maskType") is not None or "mask" in (c.get("name") or "").lower():
+                        if c.get("isMask") or "mask" in (c.get("name") or "").lower():
                             mask_child = c
                             break
                     if not mask_child and node.get("children"):
                         mask_child = node["children"][0]
 
-                    m_bbox = mask_child.get("absoluteBoundingBox", {}) if mask_child else bbox
+                    m_bbox = mask_child.get("absoluteBoundingBox") or mask_child.get("absoluteRenderBounds") or bbox
                     m_x = round(m_bbox.get("x", bbox.get("x", 0.0)) - frame_x, 2)
                     m_y = round(m_bbox.get("y", bbox.get("y", 0.0)) - frame_y, 2)
                     m_w = round(m_bbox.get("width", node_w), 2)
@@ -455,7 +574,7 @@ class FigmaConverter:
                     else:
                         png_export_nodes.append((node.get("id"), clean_id, filename))
 
-                    elements.append({
+                    img_el = {
                         "id": node.get("id"),
                         "name": node.get("name", "Image"),
                         "type": "IMAGE",
@@ -469,7 +588,15 @@ class FigmaConverter:
                         "imageFileName": filename,
                         "src": f"{settings.MEDIA_URL}figma_images/{filename}",
                         "scaleMode": img_fill.get("scaleMode", "FILL")
-                    })
+                    }
+                    if node_type == "ELLIPSE":
+                        img_el["cornerRadius"] = round(max(node_w, node_h) / 2, 2)
+                    elements.append(img_el)
+
+                    # If container has children on top of image fill, traverse them
+                    if "children" in node and node["children"]:
+                        for child in node["children"]:
+                            traverse_node(child, is_root=False)
                     return
 
                 # E. Custom Vector Shape
@@ -513,14 +640,46 @@ class FigmaConverter:
                     return
 
                 # G. Container nodes (FRAME, GROUP, COMPONENT, INSTANCE)
-                # If it has children, traverse bottom-to-top
                 if "children" in node and node["children"]:
+                    # If the container itself has visible fills or strokes (e.g. Button pill, Card, Badge),
+                    # emit its background shape first so it is preserved and sits beneath its child text/icons
+                    if node_type in ("FRAME", "COMPONENT", "INSTANCE") and (has_visible_fill(node) or has_visible_stroke(node)):
+                        cr = float(node.get("cornerRadius", 0))
+                        cr_list = node.get("rectangleCornerRadii")
+                        bg_svg_content = generate_container_svg(
+                            width=node_w,
+                            height=node_h,
+                            fills=node.get("fills"),
+                            strokes=node.get("strokes"),
+                            stroke_weight=node.get("strokeWeight", 1),
+                            corner_radius=cr,
+                            corner_radii=cr_list
+                        )
+                        bg_filename = f"vector_{clean_id}_bg.svg"
+                        generated_svg_files[bg_filename] = bg_svg_content
+                        elements.append({
+                            "id": f"{node.get('id')}_bg",
+                            "name": f"{node.get('name', 'Container')} Background",
+                            "type": "IMAGE",
+                            "x": node_x,
+                            "y": node_y,
+                            "width": node_w,
+                            "height": node_h,
+                            "rotation": rotation,
+                            "opacity": opacity,
+                            "visible": True,
+                            "imageFileName": bg_filename,
+                            "src": f"{settings.MEDIA_URL}figma_images/{bg_filename}"
+                        })
+
+                    # Traverse children bottom-to-top so they sit on top of the container's background
                     for child in node["children"]:
                         traverse_node(child, is_root=False)
                     return
                 else:
-                    # Leaf container or shape without children: export as SVG if has fills/strokes
-                    if node.get("fills") or node.get("strokes"):
+                    # Leaf container or shape without children (leaf FRAME, COMPONENT, INSTANCE, or Shape):
+                    # Export as SVG so leaf icons, illustrations, and shapes are never dropped
+                    if node.get("fills") or node.get("strokes") or node_type in ("COMPONENT", "INSTANCE", "FRAME"):
                         filename = f"vector_{clean_id}.svg"
                         svg_export_nodes.append((node.get("id"), clean_id, filename))
                         elements.append({
@@ -547,11 +706,21 @@ class FigmaConverter:
         # Run bottom-to-top traversal
         traverse_node(target_frame, is_root=True)
         logger.info(f"Traversal complete: found {len(elements)} editable elements "
-                    f"({len(svg_export_nodes)} SVGs, {len(png_export_nodes)} PNGs, {len(image_fill_nodes)} Image Fills).")
+                    f"({len(svg_export_nodes)} SVGs, {len(png_export_nodes)} PNGs, {len(image_fill_nodes)} Image Fills, {len(generated_svg_files)} Generated SVGs).")
 
         # 3. Create destination directory: media/figma_images/
         figma_images_dir = os.path.join(settings.MEDIA_ROOT, "figma_images")
         os.makedirs(figma_images_dir, exist_ok=True)
+
+        # Write any dynamically generated container background SVGs
+        for gen_filename, gen_content in generated_svg_files.items():
+            try:
+                dest = os.path.join(figma_images_dir, gen_filename)
+                with open(dest, "w", encoding="utf-8") as f:
+                    f.write(gen_content)
+                logger.info(f"Saved generated container SVG: {gen_filename}")
+            except Exception as e:
+                logger.warning(f"Failed to write generated SVG {gen_filename}: {e}")
 
         # 4. Batch export and download SVGs
         if svg_export_nodes:
