@@ -60,6 +60,9 @@ class TemplateAdminForm(forms.ModelForm):
     def clean_template_data(self):
         data = self.cleaned_data.get('template_data')
         if not data or not data.strip():
+            # If instance already has template_data, preserve it!
+            if self.instance and self.instance.pk and self.instance.template_data:
+                return self.instance.template_data
             return {}
         if isinstance(data, dict):
             return data
@@ -85,10 +88,13 @@ class TemplateAdminForm(forms.ModelForm):
             if not file_key:
                 self.add_error('figma_url', "Could not extract a valid Figma File Key from the URL. Please check your link.")
 
-        # Ensure template_data defaults to an empty dict if not set
+        # Ensure template_data defaults to existing data or an empty dict
         if not cleaned_data.get('template_data'):
-            cleaned_data['template_data'] = {}
-            self.instance.template_data = {}
+            if self.instance and self.instance.pk and self.instance.template_data:
+                cleaned_data['template_data'] = self.instance.template_data
+            else:
+                cleaned_data['template_data'] = {}
+                self.instance.template_data = {}
 
         return cleaned_data
 
@@ -136,20 +142,33 @@ class TemplateAdmin(admin.ModelAdmin):
         if not obj or not getattr(obj, 'pk', None):
             return "Empty (Draft)"
         data = getattr(obj, 'template_data', {})
-        elements = data.get('elements', []) if isinstance(data, dict) else []
-        if elements:
-            return format_html('<span style="color: #166534; font-weight: 600;">✅ Ready ({} layers)</span>', len(elements))
-        
+        if isinstance(data, dict):
+            elements = data.get('elements') or data.get('children') or []
+            if not elements and 'pages' in data:
+                total_elements = sum(len(p.get('elements', []) or p.get('children', [])) for p in data.get('pages', []))
+                if total_elements > 0:
+                    return format_html('<span style="color: #166534; font-weight: 600;">✅ Ready ({} layers)</span>', total_elements)
+            elif elements:
+                return format_html('<span style="color: #166534; font-weight: 600;">✅ Ready ({} layers)</span>', len(elements))
+
         # Check if there is an active FigmaImportJob for this template
         job = FigmaImportJob.objects.filter(template_id=obj.pk).order_by('-created_at').first()
         if job:
-            if job.status == 'processing':
-                return mark_safe('<span style="color: #1e40af; font-weight: 600;">⚙️ Importing...</span>')
+            if job.status == 'completed':
+                return mark_safe('<span style="color: #166534; font-weight: 600;">✅ Completed</span>')
+            elif job.status == 'processing':
+                return mark_safe(
+                    '<span style="color: #1e40af; font-weight: 600;">⚙️ Importing...</span>'
+                    '<script>if(!window._figma_refresher){window._figma_refresher=setTimeout(function(){location.reload();}, 3000);}</script>'
+                )
             elif job.status == 'pending':
-                return mark_safe('<span style="color: #854d0e; font-weight: 600;">⏳ Queued...</span>')
+                return mark_safe(
+                    '<span style="color: #854d0e; font-weight: 600;">⏳ Queued...</span>'
+                    '<script>if(!window._figma_refresher){window._figma_refresher=setTimeout(function(){location.reload();}, 3000);}</script>'
+                )
             elif job.status == 'failed':
                 return format_html('<span style="color: #991b1b; font-weight: 600;" title="{}">❌ Import Failed</span>', job.error_message or '')
-        
+
         return "Empty (Draft)"
     import_status_display.short_description = "Content / Layers"
 
@@ -179,10 +198,23 @@ class TemplateAdmin(admin.ModelAdmin):
         messages.info(request, f"🚀 Dispatched background Figma import for {dispatched} template(s).")
 
     def save_model(self, request, obj, form, change):
+        # Preserve existing template_data if form was submitted blank during an update
+        if change and not obj.template_data:
+            orig = Template.objects.filter(pk=obj.pk).first()
+            if orig and orig.template_data:
+                obj.template_data = orig.template_data
+
         super().save_model(request, obj, form, change)
 
+        # Check if template already has layers (elements, children, or pages)
+        t_data = obj.template_data or {}
+        has_elements = bool(
+            t_data.get('elements') or
+            t_data.get('children') or
+            any(p.get('elements') or p.get('children') for p in t_data.get('pages', []))
+        )
+
         # Non-blocking: If figma_url is provided and template has no elements, trigger background import
-        has_elements = bool(obj.template_data and obj.template_data.get('elements'))
         if obj.figma_url and not has_elements:
             from .services.figma_runner import start_figma_import_background
             active_job = FigmaImportJob.objects.filter(template=obj, status='processing').first()
@@ -196,7 +228,7 @@ class TemplateAdmin(admin.ModelAdmin):
                     existing_job.error_message = None
                     existing_job.save()
                     start_figma_import_background(existing_job.id)
-                else:
+                elif not existing_job or existing_job.status != 'completed':
                     job = FigmaImportJob.objects.create(
                         name=obj.name,
                         figma_url=obj.figma_url,

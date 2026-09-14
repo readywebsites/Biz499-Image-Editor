@@ -31,9 +31,11 @@ class FigmaImporter:
             parsed_url = urlparse(url)
             query_params = parse_qs(parsed_url.query)
             if 'node-id' in query_params:
-                node_id = query_params['node-id'][0]
-                # Normalise hyphen to colon for Figma node IDs (e.g. 4-15 -> 4:15)
-                node_id = node_id.replace('-', ':')
+                raw_node_id = query_params['node-id'][0]
+                normalized = raw_node_id.replace('-', ':')
+                # Ignore canvas/page root IDs (0:1, 0:0) so importer locates the actual design frame
+                if normalized not in ('0:1', '0:0', '0-1', '0-0'):
+                    node_id = normalized
         except Exception as e:
             logger.warning(f"Error parsing query parameters from Figma URL: {e}")
 

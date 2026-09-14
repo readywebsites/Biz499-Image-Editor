@@ -81,22 +81,50 @@ def get_svg_dimensions(svg_path):
         logger.warning(f"Failed to parse SVG dimensions from {svg_path}: {e}")
     return None, None
 
-def is_mask_group(node):
-    """Checks if a group or frame contains a mask layer as a child or is explicitly a mask group."""
+def has_text_nodes(node):
+    """Recursively checks if a node or any of its descendants is a TEXT node."""
     if not isinstance(node, dict):
         return False
+    if node.get("type") == "TEXT":
+        return True
+    for child in node.get("children", []):
+        if has_text_nodes(child):
+            return True
+    return False
+
+def is_mask_group(node):
+    """
+    Checks if a group or frame is a legitimate visual mask group (e.g. a masked photo,
+    avatar, or shape clip) that should be exported as a single raster PNG.
+    
+    CRITICAL: Never treat containers with TEXT layers or high-level layout frames as mask groups!
+    """
+    if not isinstance(node, dict):
+        return False
+
+    # Never treat frames/groups containing text layers as mask groups!
+    if has_text_nodes(node):
+        return False
+
     name = (node.get("name") or "").strip().lower()
+    node_type = node.get("type", "")
+
+    # Top-level page elements should never be treated as mask groups
+    if node_type in ("CANVAS", "DOCUMENT", "SECTION"):
+        return False
+
+    # Explicitly named mask group
     if "mask group" in name or "clip path group" in name:
         return True
-    if node.get("isMask") is True:
-        return True
-    if node.get("type") in ("FRAME", "GROUP", "COMPONENT", "INSTANCE", "BOOLEAN_OPERATION", "SECTION"):
-        for child in node.get("children", []):
-            if child.get("isMask") is True or child.get("maskType") is not None:
+
+    # Real mask group in Figma: only small clusters (<= 6 children) with an isMask child
+    children = node.get("children", [])
+    if node_type in ("FRAME", "GROUP", "COMPONENT", "INSTANCE", "BOOLEAN_OPERATION"):
+        if children and len(children) <= 6:
+            has_mask_child = any(c.get("isMask") is True or c.get("maskType") is not None for c in children)
+            if has_mask_child:
                 return True
-            child_name = (child.get("name") or "").strip().lower()
-            if child_name.startswith("mask") or child_name.startswith("clip path"):
-                return True
+
     return False
 
 def is_icon_node(node):
@@ -150,21 +178,33 @@ class FigmaConverter:
         return None
 
     def _find_main_frame(self, start_node):
-        """Finds the first FRAME or canvas frame in the document."""
+        """Finds the main FRAME or COMPONENT in the document or canvas."""
         if not start_node or not isinstance(start_node, dict):
             return None
-        if start_node.get("type") == "FRAME":
+        if start_node.get("type") in ("FRAME", "COMPONENT"):
             return start_node
-        # Search canvas children
-        children = start_node.get("children", [])
-        if children:
-            for child in children:
-                if child.get("type") == "FRAME":
-                    return child
-                if child.get("type") == "CANVAS":
-                    for canvas_child in child.get("children", []):
-                        if canvas_child.get("type") == "FRAME":
-                            return canvas_child
+
+        candidates = []
+        def _search(n):
+            if not n or not isinstance(n, dict):
+                return
+            ntype = n.get("type")
+            if ntype in ("FRAME", "COMPONENT"):
+                candidates.append(n)
+                return  # Do not recurse inside a candidate frame
+            for c in n.get("children", []):
+                _search(c)
+
+        _search(start_node)
+
+        if candidates:
+            # Sort by area (largest frame is the primary design canvas)
+            def frame_area(f):
+                bbox = f.get("absoluteBoundingBox") or f.get("absoluteRenderBounds") or {}
+                return float(bbox.get("width", 0)) * float(bbox.get("height", 0))
+            candidates.sort(key=frame_area, reverse=True)
+            return candidates[0]
+
         return None
 
     def convert(self):
@@ -198,9 +238,16 @@ class FigmaConverter:
         if not target_frame and self.target_node_id:
             target_frame = self._find_node_by_id(doc_root, self.target_node_id)
             if target_frame:
-                logger.info(f"Found target frame by ID '{self.target_node_id}': '{target_frame.get('name')}'")
+                logger.info(f"Found target node by ID '{self.target_node_id}': '{target_frame.get('name')}' ({target_frame.get('type')})")
             else:
                 logger.warning(f"Could not find node '{self.target_node_id}'. Falling back to main frame.")
+
+        # If target_frame is a CANVAS, DOCUMENT, or SECTION, resolve to the actual design FRAME inside
+        if target_frame and target_frame.get("type") in ("CANVAS", "DOCUMENT", "SECTION"):
+            resolved = self._find_main_frame(target_frame)
+            if resolved:
+                logger.info(f"Target node '{target_frame.get('id')}' was a {target_frame.get('type')}. Resolved to inner FRAME '{resolved.get('name')}' (ID: {resolved.get('id')}).")
+                target_frame = resolved
 
         if not target_frame:
             target_frame = self._find_main_frame(doc_root)
@@ -212,7 +259,13 @@ class FigmaConverter:
             else:
                 raise ValueError("No suitable Frame found in the Figma file. Please verify the URL or node-id.")
 
-        frame_bbox = target_frame.get("absoluteBoundingBox") or {}
+        # Ensure target_frame has valid bounding box and is not a canvas
+        if target_frame.get("type") in ("CANVAS", "DOCUMENT", "SECTION"):
+            resolved = self._find_main_frame(target_frame)
+            if resolved:
+                target_frame = resolved
+
+        frame_bbox = target_frame.get("absoluteBoundingBox") or target_frame.get("absoluteRenderBounds") or {}
         frame_x = frame_bbox.get("x", 0.0)
         frame_y = frame_bbox.get("y", 0.0)
         frame_w = frame_bbox.get("width", target_frame.get("width", 2000))
@@ -381,6 +434,7 @@ class FigmaConverter:
                         "opacity": opacity,
                         "visible": True,
                         "text": node.get("characters", ""),
+                        "content": node.get("characters", ""),
                         "fontFamily": font_family,
                         "fontSize": font_size,
                         "fontWeight": font_weight,
@@ -519,32 +573,17 @@ class FigmaConverter:
             except Exception as e:
                 logger.error(f"Batch SVG export failed: {e}", exc_info=True)
 
-            # Adjust vector element bounds according to downloaded SVG viewBox / frame intersection
+            # Adjust vector element bounds according to downloaded SVG viewBox if dimensions were missing
             for el in elements:
                 if el.get("type") == "IMAGE" and el.get("imageFileName", "").endswith(".svg"):
                     svg_dest = os.path.join(figma_images_dir, el["imageFileName"])
                     if os.path.exists(svg_dest):
                         svg_w, svg_h = get_svg_dimensions(svg_dest)
                         if svg_w and svg_h:
-                            inter_x = max(0.0, el["x"])
-                            inter_y = max(0.0, el["y"])
-                            inter_w = max(0.0, min(float(frame_w), el["x"] + el["width"]) - inter_x)
-                            inter_h = max(0.0, min(float(frame_h), el["y"] + el["height"]) - inter_y)
-
-                            if abs(svg_w - inter_w) < 2 and abs(svg_h - inter_h) < 2:
-                                el["x"] = round(inter_x, 2)
-                                el["y"] = round(inter_y, 2)
-                            elif abs(svg_w - inter_w) < 2:
-                                el["x"] = round(inter_x, 2)
-                            elif abs(svg_h - inter_h) < 2:
-                                el["y"] = round(inter_y, 2)
-                            else:
-                                if el["x"] < 0 and abs(svg_w - frame_w) < 2:
-                                    el["x"] = 0.0
-                                if el["y"] < 0 and abs(svg_h - frame_h) < 2:
-                                    el["y"] = 0.0
-                            el["width"] = round(svg_w, 2)
-                            el["height"] = round(svg_h, 2)
+                            if not el.get("width") or el["width"] <= 0:
+                                el["width"] = round(svg_w, 2)
+                            if not el.get("height") or el["height"] <= 0:
+                                el["height"] = round(svg_h, 2)
 
         # 5. Batch export and download PNGs (masked groups, flattened layers)
         if png_export_nodes:
@@ -566,7 +605,7 @@ class FigmaConverter:
             except Exception as e:
                 logger.error(f"Batch PNG export failed: {e}", exc_info=True)
 
-            # Adjust raster and masked group bounds according to downloaded PNG dimensions
+            # Adjust raster bounds according to downloaded PNG dimensions if dimensions were missing
             for el in elements:
                 if el.get("type") == "IMAGE" and el.get("imageFileName", "").endswith(".png"):
                     png_dest = os.path.join(figma_images_dir, el["imageFileName"])
@@ -574,28 +613,10 @@ class FigmaConverter:
                         try:
                             with Image.open(png_dest) as img:
                                 png_w, png_h = img.size
-                            is_mask = el.pop("_is_mask_group", False)
-                            inter_x = max(0.0, el["x"])
-                            inter_y = max(0.0, el["y"])
-                            inter_w = max(0.0, min(float(frame_w), el["x"] + el["width"]) - inter_x)
-                            inter_h = max(0.0, min(float(frame_h), el["y"] + el["height"]) - inter_y)
-
-                            if is_mask:
-                                if abs(png_w - inter_w) < 2 and abs(png_h - inter_h) < 2:
-                                    el["x"] = round(inter_x, 2)
-                                    el["y"] = round(inter_y, 2)
-                                elif abs(png_h - inter_h) < 2 and el["y"] < 0:
-                                    el["y"] = round(inter_y, 2)
-                                elif el["x"] < 0 and abs(png_w - frame_w) < 2:
-                                    el["x"] = 0.0
-                            else:
-                                if el["x"] < 0 and abs(png_w - frame_w) < 2:
-                                    el["x"] = 0.0
-                                if el["y"] < 0 and abs(png_h - frame_h) < 2:
-                                    el["y"] = 0.0
-
-                            el["width"] = round(float(png_w), 2)
-                            el["height"] = round(float(png_h), 2)
+                            if not el.get("width") or el["width"] <= 0:
+                                el["width"] = round(float(png_w), 2)
+                            if not el.get("height") or el["height"] <= 0:
+                                el["height"] = round(float(png_h), 2)
                         except Exception as e:
                             logger.warning(f"Could not read PNG dimensions from {png_dest}: {e}")
 
