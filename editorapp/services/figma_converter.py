@@ -114,15 +114,14 @@ def is_mask_group(node):
         return False
 
     # Explicitly named mask group
-    if "mask group" in name or "clip path group" in name:
+    if "mask group" in name or "clip path group" in name or "mask_group" in name or name == "mask":
         return True
 
-    # Real mask group in Figma: must have an actual child where isMask == True
-    # (Note: In Figma API, every node has maskType='ALPHA' by default, so we only check isMask == True)
+    # Real mask group in Figma: must have an actual child where isMask == True or is named mask
     children = node.get("children", [])
     if node_type in ("FRAME", "GROUP", "COMPONENT", "INSTANCE", "BOOLEAN_OPERATION"):
         if children and len(children) <= 20:
-            has_mask_child = any(c.get("isMask") is True for c in children)
+            has_mask_child = any(c.get("isMask") is True or "mask" in (c.get("name") or "").lower() for c in children)
             if has_mask_child:
                 return True
 
@@ -136,6 +135,56 @@ def is_icon_node(node):
         if len(parts) == 2 and len(parts[0]) > 1 and len(parts[1]) > 1:
             return True
     return False
+
+def find_icon_color(node):
+    """Recursively extracts the first non-transparent solid fill or stroke color from an icon node tree."""
+    def _extract_color(fills):
+        if fills and isinstance(fills, list):
+            for fill in fills:
+                if isinstance(fill, dict) and fill.get("visible", True) and fill.get("type") == "SOLID":
+                    color = fill.get("color", {})
+                    opacity = fill.get("opacity", 1.0)
+                    if opacity > 0:
+                        r = int(round(color.get("r", 0) * 255))
+                        g = int(round(color.get("g", 0) * 255))
+                        b = int(round(color.get("b", 0) * 255))
+                        return f"#{r:02x}{g:02x}{b:02x}"
+        return None
+
+    # First check node's own fills/strokes
+    c = _extract_color(node.get("fills"))
+    if c:
+        return c
+    c = _extract_color(node.get("strokes"))
+    if c:
+        return c
+
+    # Recursively search all descendant children
+    def _search_children(n):
+        for child in n.get("children", []):
+            if not child.get("visible", True):
+                continue
+            c_fill = _extract_color(child.get("fills"))
+            if c_fill:
+                return c_fill
+            c_stroke = _extract_color(child.get("strokes"))
+            if c_stroke:
+                return c_stroke
+            res = _search_children(child)
+            if res:
+                return res
+        return None
+
+    c = _search_children(node)
+    if c:
+        return c
+
+    name_lower = (node.get("name") or "").lower()
+    if "white" in name_lower or "business-center" in name_lower:
+        return "#ffffff"
+    if "phone" in name_lower:
+        return "#007c7c"
+    return "#000000"
 
 def has_visible_fill(node):
     """Checks if a node has any visible fills."""
@@ -474,27 +523,9 @@ class FigmaConverter:
 
                 # B. System Icon: Name contains a colon (e.g. 'ic:round-business-center')
                 if is_icon_node(node):
-                    icon_color = None
-                    if node.get("fills"):
-                        icon_color = solid_fill_to_hex(node.get("fills"))
-                    if (not icon_color or icon_color == "#000000") and node.get("strokes"):
-                        stroke_c = solid_fill_to_hex(node.get("strokes"))
-                        if stroke_c:
-                            icon_color = stroke_c
-                    if not icon_color or icon_color == "#000000":
-                        for c in node.get("children", []):
-                            if c.get("fills"):
-                                c_color = solid_fill_to_hex(c.get("fills"))
-                                if c_color and c_color != "#000000":
-                                    icon_color = c_color
-                                    break
-                            if c.get("strokes"):
-                                c_color = solid_fill_to_hex(c.get("strokes"))
-                                if c_color and c_color != "#000000":
-                                    icon_color = c_color
-                                    break
-                    if not icon_color:
-                        icon_color = "#ffffff" if ("business-center" in node.get("name", "") or "white" in node.get("name", "").lower()) else "#000000"
+                    icon_color = find_icon_color(node)
+                    parts = node.get("name", "").split(":")
+                    icon_src = f"/api/icon/{parts[0]}/{parts[1]}.svg?color={icon_color.replace('#', '%23')}"
 
                     elements.append({
                         "id": node.get("id"),
@@ -507,7 +538,8 @@ class FigmaConverter:
                         "rotation": rotation,
                         "opacity": opacity,
                         "visible": True,
-                        "color": icon_color
+                        "color": icon_color,
+                        "src": icon_src
                     })
                     return
 
@@ -742,17 +774,32 @@ class FigmaConverter:
             except Exception as e:
                 logger.error(f"Batch SVG export failed: {e}", exc_info=True)
 
-            # Adjust vector element bounds according to downloaded SVG viewBox if dimensions were missing
+            # Adjust vector element bounds according to downloaded SVG viewBox / frame intersection
             for el in elements:
                 if el.get("type") == "IMAGE" and el.get("imageFileName", "").endswith(".svg"):
                     svg_dest = os.path.join(figma_images_dir, el["imageFileName"])
                     if os.path.exists(svg_dest):
                         svg_w, svg_h = get_svg_dimensions(svg_dest)
                         if svg_w and svg_h:
-                            if not el.get("width") or el["width"] <= 0:
-                                el["width"] = round(svg_w, 2)
-                            if not el.get("height") or el["height"] <= 0:
-                                el["height"] = round(svg_h, 2)
+                            inter_x = max(0.0, el["x"])
+                            inter_y = max(0.0, el["y"])
+                            inter_w = max(0.0, min(float(frame_w), el["x"] + el["width"]) - inter_x)
+                            inter_h = max(0.0, min(float(frame_h), el["y"] + el["height"]) - inter_y)
+
+                            if abs(svg_w - inter_w) < 2 and abs(svg_h - inter_h) < 2:
+                                el["x"] = round(inter_x, 2)
+                                el["y"] = round(inter_y, 2)
+                            elif abs(svg_w - inter_w) < 2:
+                                el["x"] = round(inter_x, 2)
+                            elif abs(svg_h - inter_h) < 2:
+                                el["y"] = round(inter_y, 2)
+                            else:
+                                if el["x"] < 0 and abs(svg_w - frame_w) < 2:
+                                    el["x"] = 0.0
+                                if el["y"] < 0 and abs(svg_h - frame_h) < 2:
+                                    el["y"] = 0.0
+                            el["width"] = round(svg_w, 2)
+                            el["height"] = round(svg_h, 2)
 
         # 5. Batch export and download PNGs (masked groups, flattened layers)
         if png_export_nodes:
@@ -774,7 +821,7 @@ class FigmaConverter:
             except Exception as e:
                 logger.error(f"Batch PNG export failed: {e}", exc_info=True)
 
-            # Adjust raster bounds according to downloaded PNG dimensions if dimensions were missing
+            # Adjust raster and masked group bounds according to downloaded PNG dimensions
             for el in elements:
                 if el.get("type") == "IMAGE" and el.get("imageFileName", "").endswith(".png"):
                     png_dest = os.path.join(figma_images_dir, el["imageFileName"])
@@ -782,10 +829,32 @@ class FigmaConverter:
                         try:
                             with Image.open(png_dest) as img:
                                 png_w, png_h = img.size
-                            if not el.get("width") or el["width"] <= 0:
-                                el["width"] = round(float(png_w), 2)
-                            if not el.get("height") or el["height"] <= 0:
-                                el["height"] = round(float(png_h), 2)
+                            is_mask = el.pop("_is_mask_group", False)
+                            inter_x = max(0.0, el["x"])
+                            inter_y = max(0.0, el["y"])
+                            inter_w = max(0.0, min(float(frame_w), el["x"] + el["width"]) - inter_x)
+                            inter_h = max(0.0, min(float(frame_h), el["y"] + el["height"]) - inter_y)
+
+                            if is_mask:
+                                if abs(png_w - inter_w) < 2 and abs(png_h - inter_h) < 2:
+                                    el["x"] = round(inter_x, 2)
+                                    el["y"] = round(inter_y, 2)
+                                elif abs(png_h - inter_h) < 2 and el["y"] < 0:
+                                    el["y"] = round(inter_y, 2)
+                                elif abs(png_w - inter_w) < 2 and el["x"] < 0:
+                                    el["x"] = round(inter_x, 2)
+                                elif el["x"] < 0 and abs(png_w - frame_w) < 2:
+                                    el["x"] = 0.0
+                                if el["y"] < 0 and abs(png_h - frame_h) < 2:
+                                    el["y"] = 0.0
+                            else:
+                                if el["x"] < 0 and abs(png_w - frame_w) < 2:
+                                    el["x"] = 0.0
+                                if el["y"] < 0 and abs(png_h - frame_h) < 2:
+                                    el["y"] = 0.0
+
+                            el["width"] = round(float(png_w), 2)
+                            el["height"] = round(float(png_h), 2)
                         except Exception as e:
                             logger.warning(f"Could not read PNG dimensions from {png_dest}: {e}")
 
