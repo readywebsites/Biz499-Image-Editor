@@ -57,7 +57,7 @@ class FigmaService:
     API_BASE_URL = "https://api.figma.com/v1"
 
     def __init__(self, api_token=None):
-        env_token = None
+        env_tokens = []
         env_path = os.path.join(settings.BASE_DIR, '.env')
         if os.path.exists(env_path):
             try:
@@ -69,23 +69,46 @@ class FigmaService:
                 with open(env_path, 'r', encoding='utf-8') as f:
                     for line in f:
                         line = line.strip()
-                        if line.startswith('FIGMA_API_TOKEN='):
-                            env_token = line.split('=', 1)[1].strip().strip('"\'')
-                            break
+                        if line.startswith(('FIGMA_API_TOKEN=', 'FIGMA_API_TOKENS=')):
+                            val = line.split('=', 1)[1].strip().strip('"\'')
+                            env_tokens.extend([t.strip() for t in val.split(',') if t.strip()])
             except Exception:
                 pass
 
-        token = api_token or os.getenv('FIGMA_API_TOKEN') or env_token or getattr(settings, 'FIGMA_API_TOKEN', None)
-        if token:
-            token = token.strip().strip('"\'')
-        self.api_token = token
-        
-        if not self.api_token or self.api_token == "your_figma_api_token_here":
+        token_candidates = []
+        raw_sources = [
+            api_token,
+            os.getenv('FIGMA_API_TOKENS'),
+            os.getenv('FIGMA_API_TOKEN'),
+            getattr(settings, 'FIGMA_API_TOKEN', None)
+        ] + env_tokens
+
+        for raw in raw_sources:
+            if raw and isinstance(raw, str):
+                for part in raw.split(','):
+                    clean = part.strip().strip('"\'')
+                    if clean and clean != "your_figma_api_token_here" and clean not in token_candidates:
+                        token_candidates.append(clean)
+
+        self.tokens = token_candidates
+        self.current_token_index = 0
+        if not self.tokens:
             raise ValueError(
                 "Figma API token is not configured. Please set FIGMA_API_TOKEN in your backend/.env file "
                 "or enter your active Figma Personal Access Token."
             )
+        self.api_token = self.tokens[0]
         self.headers = {"X-Figma-Token": self.api_token}
+
+    def rotate_token(self):
+        """Switches to the next configured Figma API token if multiple tokens exist."""
+        if len(self.tokens) > 1:
+            self.current_token_index = (self.current_token_index + 1) % len(self.tokens)
+            self.api_token = self.tokens[self.current_token_index]
+            self.headers = {"X-Figma-Token": self.api_token}
+            logger.info(f"Rotated Figma API token to candidate #{self.current_token_index + 1} of {len(self.tokens)}.")
+            return True
+        return False
 
     def _handle_error(self, response, e):
         """A helper to format HTTP errors with actionable feedback."""
@@ -120,12 +143,19 @@ class FigmaService:
             if limit_type:
                 details.append(f"rate limit type '{limit_type}'")
             if retry_after:
-                details.append(f"cooldown: {retry_after}s")
+                try:
+                    sec = int(float(retry_after))
+                    if sec >= 3600:
+                        details.append(f"cooldown: {round(sec / 3600, 1)} hours")
+                    else:
+                        details.append(f"cooldown: {sec}s")
+                except Exception:
+                    details.append(f"cooldown: {retry_after}s")
             extra = f" ({', '.join(details)})" if details else ""
             msg = (
                 f"Figma API rate limit exceeded ({msg}){extra}. "
-                "Figma limits REST API requests based on account and file tier. "
-                "Please wait a minute before retrying, or provide a Personal Access Token with elevated limits."
+                "Figma Starter accounts have strict multi-day limits on reading files. "
+                "To import now without waiting for the cooldown, enter a Figma Personal Access Token from another Figma account."
             )
 
         e.args = (f"Figma API Error ({response.status_code}): {msg}",)

@@ -66,7 +66,12 @@ def system_diagnostics_view(request):
             if r1.status_code == 200:
                 tier1_status = f"OK (200) - Plan: {plan_tier or 'standard'}, Limit: {limit_type or 'standard'}"
             elif r1.status_code == 429:
-                tier1_status = f"RATE LIMITED (429) - Retry-After: {retry_after}s, Plan: {plan_tier}, Limit: {limit_type}"
+                try:
+                    sec = int(float(retry_after))
+                    cooldown_str = f"{round(sec / 3600, 1)} hours" if sec >= 3600 else f"{sec}s"
+                except Exception:
+                    cooldown_str = f"{retry_after}s"
+                tier1_status = f"RATE LIMITED (429) - Cooldown remaining: {cooldown_str}, Plan: {plan_tier}, Limit: {limit_type}"
             else:
                 tier1_status = f"STATUS {r1.status_code}: {r1.text[:120]}"
         except Exception as e1:
