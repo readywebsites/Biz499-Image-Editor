@@ -6,7 +6,10 @@ django.setup()
 
 from editorapp.models import Template
 
-t = Template.objects.get(id=47)
-for i in range(min(4, len(t.template_data['elements']))):
-    e = t.template_data['elements'][i]
-    print(f"[{i}] id={e.get('id')} name={e.get('name')} type={e.get('type')} file={e.get('imageFileName')} src={e.get('src')}")
+t = Template.objects.order_by('-id').first()
+print(f"Latest template ID: {t.id}, Name: {t.name}, Created: {t.created_at}")
+elements = t.template_data.get('elements', [])
+print(f"Elements count: {len(elements)}")
+for i, e in enumerate(elements):
+    print(f"[{i:2d}] id={e.get('id'):<8} name={str(e.get('name'))[:30]:<30} type={e.get('type'):<8} file={e.get('imageFileName')} src={e.get('src')}")
+
