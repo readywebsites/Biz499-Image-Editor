@@ -1,5 +1,8 @@
+import os
+import re
 import requests
 from django.http import HttpResponse, Http404
+from django.conf import settings
 from ..models import Template
 
 def find_node_by_hash(node, image_hash):
@@ -89,14 +92,44 @@ def serve_image(request, image_hash):
 
 def serve_icon(request, provider, name):
     color = request.GET.get('color', '#ffffff')
+    cache_dir = os.path.join(settings.MEDIA_ROOT, 'icon_cache')
+    os.makedirs(cache_dir, exist_ok=True)
+    safe_color = re.sub(r'[^a-zA-Z0-9]', '', color)
+    cache_path = os.path.join(cache_dir, f"{provider}_{name}_{safe_color}.svg")
+
+    if os.path.exists(cache_path):
+        try:
+            with open(cache_path, 'rb') as f:
+                content = f.read()
+            django_response = HttpResponse(content, content_type='image/svg+xml')
+            django_response["Access-Control-Allow-Origin"] = "*"
+            return django_response
+        except Exception:
+            pass
+
     url = f"https://api.iconify.design/{provider}/{name}.svg?color={color.replace('#', '%23')}"
     try:
         response = requests.get(url, timeout=10)
         response.raise_for_status()
-        django_response = HttpResponse(response.content, content_type='image/svg+xml')
+        content = response.content
+        try:
+            with open(cache_path, 'wb') as f:
+                f.write(content)
+        except Exception:
+            pass
+        django_response = HttpResponse(content, content_type='image/svg+xml')
         django_response["Access-Control-Allow-Origin"] = "*"
         return django_response
     except Exception as e:
+        if os.path.exists(cache_path):
+            try:
+                with open(cache_path, 'rb') as f:
+                    content = f.read()
+                django_response = HttpResponse(content, content_type='image/svg+xml')
+                django_response["Access-Control-Allow-Origin"] = "*"
+                return django_response
+            except Exception:
+                pass
         raise Http404(f"Error fetching icon: {e}")
 
 from django.views.decorators.csrf import csrf_exempt

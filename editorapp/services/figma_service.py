@@ -9,8 +9,11 @@ from django.conf import settings
 
 logger = logging.getLogger(__name__)
 
-def retry_request(func, max_tries=2, initial_delay=0.3):
-    """Dependency-free exponential backoff retry for HTTP requests."""
+def retry_request(func, max_tries=5, initial_delay=1.0):
+    """
+    Dependency-free exponential backoff retry for HTTP requests with robust
+    Figma rate limit (429) handling. Accurately respects Retry-After headers.
+    """
     delay = initial_delay
     for attempt in range(1, max_tries + 1):
         try:
@@ -20,21 +23,33 @@ def retry_request(func, max_tries=2, initial_delay=0.3):
             if attempt < max_tries and status in (429, 500, 502, 503, 504):
                 retry_after = e.response.headers.get('Retry-After') if e.response is not None else None
                 sleep_time = delay
-                if retry_after:
-                    try:
-                        sleep_time = min(10, int(retry_after))
-                    except ValueError:
-                        pass
-                logger.warning(f"Figma API request returned {status}. Retrying in {sleep_time}s (attempt {attempt}/{max_tries})...")
+                if status == 429:
+                    if retry_after:
+                        try:
+                            # Respect Figma's Retry-After cooldown plus 1 second safety buffer (up to 90s)
+                            val = int(float(retry_after))
+                            sleep_time = min(90, max(1, val + 1))
+                        except (ValueError, TypeError):
+                            sleep_time = max(15, delay)
+                    else:
+                        # For 429 with no header, back off by at least 15s
+                        sleep_time = max(15, delay)
+                else:
+                    sleep_time = delay
+
+                logger.warning(
+                    f"Figma API request returned {status}. Retrying in {sleep_time}s "
+                    f"(attempt {attempt}/{max_tries}, Retry-After: {retry_after})..."
+                )
                 time.sleep(sleep_time)
-                delay *= 1.5
+                delay = min(60, delay * 2)
             else:
                 raise
         except requests.RequestException as e:
             if attempt < max_tries:
                 logger.warning(f"Figma API network error: {e}. Retrying in {delay}s (attempt {attempt}/{max_tries})...")
                 time.sleep(delay)
-                delay *= 1.5
+                delay = min(30, delay * 1.5)
             else:
                 raise
 
@@ -96,7 +111,22 @@ class FigmaService:
         elif response.status_code == 404:
             msg = f"Figma file or node was not found ({msg}). Please verify your Figma URL."
         elif response.status_code == 429:
-            msg = f"Figma API rate limit exceeded ({msg}). Please wait a minute and try again."
+            retry_after = response.headers.get('Retry-After')
+            plan_tier = response.headers.get('X-Figma-Plan-Tier')
+            limit_type = response.headers.get('X-Figma-Rate-Limit-Type')
+            details = []
+            if plan_tier:
+                details.append(f"plan tier '{plan_tier}'")
+            if limit_type:
+                details.append(f"rate limit type '{limit_type}'")
+            if retry_after:
+                details.append(f"cooldown: {retry_after}s")
+            extra = f" ({', '.join(details)})" if details else ""
+            msg = (
+                f"Figma API rate limit exceeded ({msg}){extra}. "
+                "Figma limits REST API requests based on account and file tier. "
+                "Please wait a minute before retrying, or provide a Personal Access Token with elevated limits."
+            )
 
         e.args = (f"Figma API Error ({response.status_code}): {msg}",)
         raise e
@@ -107,7 +137,8 @@ class FigmaService:
         logger.info(f"Making Figma API call: GET {url}")
 
         def _fetch():
-            response = requests.get(url, headers=self.headers, timeout=12)
+            time.sleep(0.2)
+            response = requests.get(url, headers=self.headers, timeout=15)
             response.raise_for_status()
             return response.json()
 
@@ -123,7 +154,8 @@ class FigmaService:
         logger.info(f"Making Figma API call: GET {url}?ids={node_id}")
 
         def _fetch():
-            response = requests.get(url, headers=self.headers, params=params, timeout=12)
+            time.sleep(0.2)
+            response = requests.get(url, headers=self.headers, params=params, timeout=15)
             response.raise_for_status()
             return response.json()
 
@@ -138,7 +170,8 @@ class FigmaService:
         logger.info(f"Making Figma API call: GET {url}")
 
         def _fetch():
-            response = requests.get(url, headers=self.headers, timeout=12)
+            time.sleep(0.2)
+            response = requests.get(url, headers=self.headers, timeout=15)
             response.raise_for_status()
             data = response.json()
             return data.get("meta", {}).get("images", {})
@@ -149,7 +182,7 @@ class FigmaService:
             logger.warning(f"Failed to fetch image fills mapping: {e}")
             return {}
 
-    def export_nodes_as_svg(self, file_key, node_ids, chunk_size=30):
+    def export_nodes_as_svg(self, file_key, node_ids, chunk_size=100):
         """Batch exports custom vector and shape nodes as SVG."""
         if not node_ids:
             return {}
@@ -164,7 +197,8 @@ class FigmaService:
             logger.info(f"Exporting batch of {len(chunk)} SVG nodes: GET {url}")
 
             def _fetch():
-                response = requests.get(url, headers=self.headers, params=params, timeout=12)
+                time.sleep(0.3)
+                response = requests.get(url, headers=self.headers, params=params, timeout=15)
                 response.raise_for_status()
                 data = response.json()
                 return data.get("images", {})
@@ -175,10 +209,10 @@ class FigmaService:
             except HTTPError as e:
                 self._handle_error(e.response, e)
             if i + chunk_size < len(node_ids):
-                time.sleep(0.5)
+                time.sleep(1.0)
         return result
 
-    def export_nodes_as_png(self, file_key, node_ids, scale=1, chunk_size=30, use_absolute_bounds=False):
+    def export_nodes_as_png(self, file_key, node_ids, scale=1, chunk_size=100, use_absolute_bounds=False):
         """Batch exports nodes (frames, masked groups, images) as PNG."""
         if not node_ids:
             return {}
@@ -196,7 +230,8 @@ class FigmaService:
             logger.info(f"Exporting batch of {len(chunk)} PNG nodes: GET {url}")
 
             def _fetch():
-                response = requests.get(url, headers=self.headers, params=params, timeout=12)
+                time.sleep(0.3)
+                response = requests.get(url, headers=self.headers, params=params, timeout=15)
                 response.raise_for_status()
                 data = response.json()
                 return data.get("images", {})
@@ -207,7 +242,7 @@ class FigmaService:
             except HTTPError as e:
                 self._handle_error(e.response, e)
             if i + chunk_size < len(node_ids):
-                time.sleep(0.5)
+                time.sleep(1.0)
         return result
 
     def export_node_as_png(self, file_key, node_id, scale=1):

@@ -7,6 +7,10 @@ from django.conf import settings
 
 logger = logging.getLogger(__name__)
 
+# Concurrency control: limits parallel Figma import jobs to 1 at a time.
+# Prevents multiple concurrent threads from flooding Figma's REST API and hitting 429 rate limits.
+_figma_import_semaphore = threading.Semaphore(1)
+
 def sanitize_error_message(error_str):
     """
     Sanitizes error messages to ensure no tokens, credentials, or sensitive headers
@@ -50,82 +54,75 @@ def process_figma_job(job_id):
         logger.warning(f"FigmaImportJob ID {job_id} not found after retrying.")
         return
 
-    if job.status == 'processing':
-        # Allow recovery if a previous worker crashed and job has been stuck for >10m
-        from django.utils import timezone
-        import datetime
-        stale_threshold = timezone.now() - datetime.timedelta(minutes=10)
-        if job.updated_at and job.updated_at > stale_threshold:
-            logger.info(f"FigmaImportJob ID {job_id} is already actively processing. Skipping duplicate execution.")
+    with _figma_import_semaphore:
+        # Re-fetch latest job status inside the lock
+        job = FigmaImportJob.objects.filter(id=job_id).first()
+        if not job or job.status == 'completed':
             return
-        logger.warning(f"FigmaImportJob ID {job_id} was stuck in 'processing' for >10 minutes. Resuming execution.")
-    elif job.status == 'completed':
-        logger.info(f"FigmaImportJob ID {job_id} is already completed. Skipping duplicate execution.")
-        return
 
-    try:
-        # Mark job as processing
-        job.status = 'processing'
-        job.error_message = None
-        job.save(update_fields=['status', 'error_message', 'updated_at'])
-        logger.info(f"Starting background processing for FigmaImportJob ID {job_id} ('{job.name}')...")
-
-        # Run the full importer
-        importer = FigmaImporter()
-        result = importer.import_from_url(job.figma_url, job.name)
-
-        # Update existing linked template, or create a new published template
-        template = job.template
-        if template:
-            template.name = job.name
-            template.figma_url = job.figma_url
-            template.template_data = result['template_data']
-            template.background_image = result['background_image_path']
-            template.width = result['width']
-            template.height = result['height']
-            template.status = 'published'
-            template.save()
-            logger.info(f"Updated existing Template ID {template.id} ('{template.name}') from job ID {job_id}.")
-        else:
-            template = Template.objects.create(
-                name=job.name,
-                figma_url=job.figma_url,
-                template_data=result['template_data'],
-                background_image=result['background_image_path'],
-                width=result['width'],
-                height=result['height'],
-                status='published'
-            )
-            job.template = template
-            logger.info(f"Created new Template ID {template.id} ('{template.name}') from job ID {job_id}.")
-
-        # Mark job as completed
-        job.status = 'completed'
-        job.error_message = None
-        job.save(update_fields=['status', 'error_message', 'template', 'updated_at'])
-        element_count = len(result['template_data'].get('elements', []))
-        logger.info(f"Successfully finished FigmaImportJob ID {job_id} with {element_count} elements.")
-
-    except Exception as e:
-        logger.error(f"Figma import failed for job ID {job_id}: {e}", exc_info=True)
         try:
-            for attempt in range(5):
-                try:
-                    job = FigmaImportJob.objects.filter(id=job_id).first()
-                    if job:
-                        job.status = 'failed'
-                        job.error_message = sanitize_error_message(str(e))
-                        job.save(update_fields=['status', 'error_message', 'updated_at'])
-                    break
-                except OperationalError:
-                    if attempt < 4:
-                        time.sleep(0.3)
-                    else:
-                        raise
-        except Exception as db_err:
-            logger.error(f"Failed to persist error status for FigmaImportJob ID {job_id}: {db_err}")
-    finally:
-        connections.close_all()
+            # Mark job as processing
+            job.status = 'processing'
+            job.error_message = None
+            job.save(update_fields=['status', 'error_message', 'updated_at'])
+            logger.info(f"Starting background processing for FigmaImportJob ID {job_id} ('{job.name}')...")
+
+            # Run the full importer
+            importer = FigmaImporter()
+            result = importer.import_from_url(job.figma_url, job.name)
+
+            # Update existing linked template, or create a new published template
+            template = job.template
+            if template:
+                template.name = job.name
+                template.figma_url = job.figma_url
+                template.template_data = result['template_data']
+                template.background_image = result['background_image_path']
+                template.width = result['width']
+                template.height = result['height']
+                template.status = 'published'
+                template.save()
+                logger.info(f"Updated existing Template ID {template.id} ('{template.name}') from job ID {job_id}.")
+            else:
+                template = Template.objects.create(
+                    name=job.name,
+                    figma_url=job.figma_url,
+                    template_data=result['template_data'],
+                    background_image=result['background_image_path'],
+                    width=result['width'],
+                    height=result['height'],
+                    status='published'
+                )
+                job.template = template
+                logger.info(f"Created new Template ID {template.id} ('{template.name}') from job ID {job_id}.")
+
+            # Mark job as completed
+            job.status = 'completed'
+            job.error_message = None
+            job.save(update_fields=['status', 'error_message', 'template', 'updated_at'])
+            element_count = len(result['template_data'].get('elements', []))
+            logger.info(f"Successfully finished FigmaImportJob ID {job_id} with {element_count} elements.")
+
+        except Exception as e:
+            logger.error(f"Figma import failed for job ID {job_id}: {e}", exc_info=True)
+            try:
+                for attempt in range(5):
+                    try:
+                        job = FigmaImportJob.objects.filter(id=job_id).first()
+                        if job:
+                            job.status = 'failed'
+                            job.error_message = sanitize_error_message(str(e))
+                            job.save(update_fields=['status', 'error_message', 'updated_at'])
+                        break
+                    except OperationalError:
+                        if attempt < 4:
+                            time.sleep(0.3)
+                        else:
+                            raise
+            except Exception as db_err:
+                logger.error(f"Failed to persist error status for FigmaImportJob ID {job_id}: {db_err}")
+        finally:
+            connections.close_all()
 
 def start_figma_import_background(job_id):
     """

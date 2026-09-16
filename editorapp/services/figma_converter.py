@@ -325,6 +325,17 @@ class FigmaConverter:
         self.file_key = file_key
         self.target_node_id = target_node_id
         self.template_name = template_name
+        self._cached_images_map = None
+
+    def _get_file_images_cached(self):
+        """Fetches and caches Figma image fills mapping (imageHash -> S3 URL) once per conversion."""
+        if self._cached_images_map is None:
+            try:
+                self._cached_images_map = self.figma_service.get_file_images(self.file_key)
+            except Exception as e:
+                logger.warning(f"Failed to fetch image mapping: {e}")
+                self._cached_images_map = {}
+        return self._cached_images_map
 
     def _find_node_by_id(self, node, target_id):
         """Recursively finds a node with the specified ID."""
@@ -653,22 +664,36 @@ class FigmaConverter:
 
                 # F. Rectangle Shape (buttons, cards, banners, bars)
                 if node_type == "RECTANGLE":
-                    filename = f"vector_{clean_id}.svg"
-                    svg_export_nodes.append((node.get("id"), clean_id, filename))
-                    elements.append({
-                        "id": node.get("id"),
-                        "name": node.get("name", "Rectangle"),
-                        "type": "IMAGE",
-                        "x": node_x,
-                        "y": node_y,
-                        "width": node_w,
-                        "height": node_h,
-                        "rotation": rotation,
-                        "opacity": opacity,
-                        "visible": True,
-                        "imageFileName": filename,
-                        "src": f"{settings.MEDIA_URL}figma_images/{filename}"
-                    })
+                    # If this rectangle has visible fills or strokes, generate SVG locally!
+                    # This completely avoids calling Figma API (/v1/images) for standard rectangles/cards/bars
+                    if has_visible_fill(node) or has_visible_stroke(node):
+                        cr = float(node.get("cornerRadius", 0))
+                        cr_list = node.get("rectangleCornerRadii")
+                        rect_svg_content = generate_container_svg(
+                            width=node_w,
+                            height=node_h,
+                            fills=node.get("fills"),
+                            strokes=node.get("strokes"),
+                            stroke_weight=node.get("strokeWeight", 1),
+                            corner_radius=cr,
+                            corner_radii=cr_list
+                        )
+                        filename = f"vector_{clean_id}.svg"
+                        generated_svg_files[filename] = rect_svg_content
+                        elements.append({
+                            "id": node.get("id"),
+                            "name": node.get("name", "Rectangle"),
+                            "type": "IMAGE",
+                            "x": node_x,
+                            "y": node_y,
+                            "width": node_w,
+                            "height": node_h,
+                            "rotation": rotation,
+                            "opacity": opacity,
+                            "visible": True,
+                            "imageFileName": filename,
+                            "src": f"{settings.MEDIA_URL}figma_images/{filename}"
+                        })
                     return
 
                 # G. Container nodes (FRAME, GROUP, COMPONENT, INSTANCE)
@@ -710,8 +735,8 @@ class FigmaConverter:
                     return
                 else:
                     # Leaf container or shape without children (leaf FRAME, COMPONENT, INSTANCE, or Shape):
-                    # Export as SVG so leaf icons, illustrations, and shapes are never dropped
-                    if node.get("fills") or node.get("strokes") or node_type in ("COMPONENT", "INSTANCE", "FRAME"):
+                    # Export as SVG only if it has visible fills or strokes
+                    if has_visible_fill(node) or has_visible_stroke(node):
                         filename = f"vector_{clean_id}.svg"
                         svg_export_nodes.append((node.get("id"), clean_id, filename))
                         elements.append({
@@ -860,11 +885,7 @@ class FigmaConverter:
 
         # 6. Download image fills from Figma image hash mapping
         if image_fill_nodes:
-            try:
-                images_map = self.figma_service.get_file_images(self.file_key)
-            except Exception as e:
-                logger.warning(f"Failed to fetch image mapping: {e}")
-                images_map = {}
+            images_map = self._get_file_images_cached()
 
             missing_image_nodes = []
             for nid, clean_id, filename, img_hash in image_fill_nodes:
@@ -966,7 +987,7 @@ class FigmaConverter:
         bg_saved = False
         if bg_image_hash:
             try:
-                images_map = self.figma_service.get_file_images(self.file_key)
+                images_map = self._get_file_images_cached()
                 s3_url = images_map.get(bg_image_hash)
                 if s3_url:
                     resp = requests.get(s3_url, timeout=25)

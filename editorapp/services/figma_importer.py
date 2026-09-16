@@ -100,8 +100,9 @@ class FigmaImporter:
                     figma_document = node_response
                     logger.info(f"Successfully fetched targeted node '{node_id}'.")
             except Exception as e:
-                # If authentication or authorization failed, fail fast instead of retrying
-                if hasattr(e, 'response') and getattr(e.response, 'status_code', None) in (401, 403):
+                # If authentication, authorization, or rate limit failed, fail fast instead of hammering full document
+                status_code = getattr(getattr(e, 'response', None), 'status_code', None)
+                if status_code in (401, 403, 429) or "429" in str(e) or "rate limit" in str(e).lower():
                     raise
                 logger.warning(f"Failed to fetch targeted node '{node_id}': {e}. Falling back to full document...")
 

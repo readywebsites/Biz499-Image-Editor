@@ -53,8 +53,27 @@ def system_diagnostics_view(request):
                 token_status = f"INVALID/EXPIRED ({r.status_code}): {err_text}"
         except Exception as te:
             token_status = f"CHECK ERROR: {te}"
+        tier1_status = 'not checked'
+        try:
+            r1 = requests.get(
+                'https://api.figma.com/v1/files/BnSvyoOglXYZcUIu1eQCPy/nodes?ids=3:4',
+                headers={'X-Figma-Token': clean_tok},
+                timeout=5
+            )
+            retry_after = r1.headers.get('Retry-After')
+            plan_tier = r1.headers.get('X-Figma-Plan-Tier')
+            limit_type = r1.headers.get('X-Figma-Rate-Limit-Type')
+            if r1.status_code == 200:
+                tier1_status = f"OK (200) - Plan: {plan_tier or 'standard'}, Limit: {limit_type or 'standard'}"
+            elif r1.status_code == 429:
+                tier1_status = f"RATE LIMITED (429) - Retry-After: {retry_after}s, Plan: {plan_tier}, Limit: {limit_type}"
+            else:
+                tier1_status = f"STATUS {r1.status_code}: {r1.text[:120]}"
+        except Exception as e1:
+            tier1_status = f"Error testing Tier 1: {e1}"
     else:
         token_preview = 'NOT CONFIGURED'
+        tier1_status = 'Token not configured'
 
     return JsonResponse({
         'status': 'online',
@@ -63,6 +82,7 @@ def system_diagnostics_view(request):
         'db_status': db_status,
         'figma_token': token_preview,
         'figma_token_health': token_status,
+        'figma_tier1_health': tier1_status,
         'recent_errors': [l.strip() for l in error_log_lines if l.strip()],
     }, json_dumps_params={'indent': 2})
 
